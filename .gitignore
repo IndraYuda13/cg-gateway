@@ -16,6 +16,8 @@ data/
 
 # Temporary diagnostic scripts in root only
 /test_*.py
+!/test_chatgpt_live.py
+cleanup_temp.py
 
 # IDE
 .vscode/

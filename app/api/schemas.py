@@ -12,6 +12,8 @@ class ChatCompletionRequest(BaseModel):
     messages: List[MessageItem]
     stream: Optional[bool] = False
     thinking: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
+    thinking_effort: Optional[str] = None
     session_id: Optional[str] = None
     new_session: Optional[bool] = False
     user: Optional[str] = None
@@ -23,6 +25,8 @@ class SimpleChatRequest(BaseModel):
     prompt: str
     model: Optional[str] = "gpt-5-6-thinking"
     thinking: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
+    thinking_effort: Optional[str] = None
     stream: Optional[bool] = False
     new_session: Optional[bool] = False
     user: Optional[str] = None

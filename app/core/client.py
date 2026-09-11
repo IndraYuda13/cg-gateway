@@ -151,7 +151,8 @@ class ChatGPTUpstreamClient:
         model: str,
         parent_message_id: str = "client-created-root",
         prompt: str = "",
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        thinking: Optional[bool] = None
     ) -> str:
         """
         Prepares conversation context and retrieves the conduit token.
@@ -159,7 +160,7 @@ class ChatGPTUpstreamClient:
         conv_prep_url = f"{self.base_url}/backend-api/f/conversation/prepare"
         headers = {"X-Conduit-Token": "no-token", "Content-Type": "application/json"}
         
-        is_thinking = "thinking" in model.lower() or model.lower() in ("o3-pro", "gpt-5-6-pro", "gpt-6-pro")
+        is_thinking = ("thinking" in model.lower() or model.lower() in ("o3-pro", "gpt-5-6-pro", "gpt-6-pro")) if thinking is None else bool(thinking)
         payload = {
             "action": "next",
             "parent_message_id": parent_message_id,
@@ -222,7 +223,8 @@ class ChatGPTUpstreamClient:
             model=model,
             parent_message_id=parent_message_id,
             prompt=prompt,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            thinking=thinking
         )
 
         conv_url = f"{self.base_url}/backend-api/f/conversation"
@@ -237,9 +239,7 @@ class ChatGPTUpstreamClient:
             headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
 
         msg_id = str(uuid.uuid4())
-        is_thinking = "thinking" in model.lower()
-        if thinking is not None:
-            is_thinking = thinking
+        is_thinking = ("thinking" in model.lower() or model.lower() in ("o3-pro", "gpt-5-6-pro", "gpt-6-pro")) if thinking is None else bool(thinking)
 
         payload: Dict[str, Any] = {
             "action": "next",
@@ -345,10 +345,16 @@ class ChatGPTUpstreamClient:
                         yield {"type": "text", "content": i_val}
                     elif (i_path == "" or i_path is None) and (i_op == "" or i_op is None) and isinstance(i_val, str):
                         yield {"type": "text", "content": i_val}
+                    elif ("reasoning" in str(i_path) or "thought" in str(i_path)) and isinstance(i_val, str):
+                        yield {"type": "reasoning", "reasoning": i_val}
 
             # Standalone delta string token frame {"v": "..."} where p and o are omitted / empty / None
             elif (path == "" or path is None) and (op == "" or op is None) and isinstance(val, str):
                 yield {"type": "text", "content": val}
+
+            # Direct reasoning append if path matches
+            elif ("reasoning" in str(path) or "thought" in str(path)) and isinstance(val, str):
+                yield {"type": "reasoning", "reasoning": val}
 
             # Check for message structure updates
             elif isinstance(val, dict):
@@ -363,8 +369,10 @@ class ChatGPTUpstreamClient:
                     c_type = content_obj.get("content_type")
 
                     # Handle reasoning / thought content
-                    if c_type == "reasoning_recap":
-                        recap_text = content_obj.get("content", "")
+                    if c_type in ("reasoning_recap", "thought", "reasoning"):
+                        recap_text = content_obj.get("content") or content_obj.get("text") or ""
+                        if not recap_text and isinstance(content_obj.get("parts"), list):
+                            recap_text = "".join(str(p) for p in content_obj.get("parts", []))
                         if recap_text:
                             yield {"type": "reasoning", "reasoning": recap_text}
 

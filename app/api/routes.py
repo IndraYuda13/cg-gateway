@@ -153,13 +153,21 @@ def sse_event_stream(
     if parent_msg_id and parent_msg_id != "client-created-root":
         conv_id_for_upstream = session_id
 
+    effective_thinking = req.thinking
+    effort = (req.reasoning_effort or req.thinking_effort or "").lower()
+    if effective_thinking is None and effort:
+        if effort in ("high", "extended", "medium", "max"):
+            effective_thinking = True
+        elif effort in ("none", "low", "minimal", "off"):
+            effective_thinking = False
+
     try:
         for event in client.stream_chat(
             prompt=prompt,
             model=req.model or "gpt-5-6-thinking",
             parent_message_id=parent_msg_id or "client-created-root",
             conversation_id=conv_id_for_upstream,
-            thinking=req.thinking
+            thinking=effective_thinking
         ):
             e_type = event.get("type")
 
@@ -320,12 +328,20 @@ def chat_completions(
         if parent_id_to_use != "client-created-root":
             conv_id_for_upstream = session_id
 
+        effective_thinking = req.thinking
+        effort = (req.reasoning_effort or req.thinking_effort or "").lower()
+        if effective_thinking is None and effort:
+            if effort in ("high", "extended", "medium", "max"):
+                effective_thinking = True
+            elif effort in ("none", "low", "minimal", "off"):
+                effective_thinking = False
+
         completion_res = client.chat_completion(
             prompt=last_user_prompt,
             model=req.model or "gpt-5-6-thinking",
             parent_message_id=parent_id_to_use,
             conversation_id=conv_id_for_upstream,
-            thinking=req.thinking
+            thinking=effective_thinking
         )
 
         final_conv_id = completion_res.get("conversation_id")
