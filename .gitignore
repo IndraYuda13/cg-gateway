@@ -14,8 +14,8 @@ data/
 *.log
 *.tmp
 
-# Temporary diagnostic scripts in root
-test_*.py
+# Temporary diagnostic scripts in root only
+/test_*.py
 
 # IDE
 .vscode/
