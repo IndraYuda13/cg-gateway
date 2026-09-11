@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# Data / Session State / Credentials
+data/
+*.log
+*.tmp
+
+# Temporary diagnostic scripts in root
+test_*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp

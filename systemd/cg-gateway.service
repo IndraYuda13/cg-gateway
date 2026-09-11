@@ -1,0 +1,17 @@
+[Unit]
+Description=cg-gateway: OpenAI-Compatible API Gateway for ChatGPT Web Upstream
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/projects/cg-gateway
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 /root/projects/cg-gateway/server.py
+Restart=always
+RestartSec=3s
+Environment=PORT=8560
+Environment=HOST=0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
