@@ -187,6 +187,15 @@ class SmartSessionPool:
 
         if not force_new and target_key in self.pool:
             entry = self.pool[target_key]
+            # Expire stale sessions older than 1 hour (3600s)
+            if now - entry.last_active > 3600:
+                entry.session_id = None
+                entry.parent_message_id = "client-created-root"
+                entry.last_active = now
+                entry.turn_count = 1
+                self.save()
+                return None, "client-created-root"
+
             entry.last_active = now
             entry.turn_count += 1
             self.save()

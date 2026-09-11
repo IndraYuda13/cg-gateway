@@ -10,10 +10,11 @@ import sys
 import os
 import json
 import time
+import base64
 import urllib.request
 import urllib.error
 import argparse
-from typing import Generator, Dict, Any, Tuple, Optional, List
+from typing import Generator, Dict, Any, Tuple, Optional, List, Union
 
 # Enable ANSI escape sequences on Windows console
 if sys.platform == "win32":
@@ -34,6 +35,36 @@ RED = "\033[31m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+
+
+def encode_image_source(path_or_url: str) -> str:
+    """
+    Normalizes local file path or web URL into an OpenAI vision image_url string.
+    Local files are converted to base64 data URIs.
+    """
+    target = path_or_url.strip()
+    if target.startswith("data:") or target.startswith("http://") or target.startswith("https://"):
+        return target
+
+    file_path = target[7:] if target.startswith("file://") else target
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Image file not found: {file_path}")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp"
+    }
+    mime = mime_map.get(ext, "image/png")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
 
 def color(text: str, c: str) -> str:
@@ -89,7 +120,7 @@ class ChatGPTCLIClient:
 
     def stream_chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         model: str = DEFAULT_MODEL,
         thinking: Optional[bool] = None,
         session_id: Optional[str] = None,
@@ -139,7 +170,7 @@ class ChatGPTCLIClient:
 
     def buffered_chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         model: str = DEFAULT_MODEL,
         thinking: Optional[bool] = None,
         session_id: Optional[str] = None,
@@ -170,7 +201,7 @@ class ChatGPTCLIClient:
             return json.loads(resp.read().decode("utf-8", errors="ignore"))
 
 
-def run_streaming_verification(client: ChatGPTCLIClient, model: str, prompt: str) -> bool:
+def run_streaming_verification(client: ChatGPTCLIClient, model: str, prompt: Union[str, List[Dict[str, Any]]]) -> bool:
     print(f"\n{color('--- [Running Streaming SSE Verification] ---', MAGENTA + BOLD)}")
     t0 = time.time()
     in_think = False
@@ -212,7 +243,7 @@ def run_streaming_verification(client: ChatGPTCLIClient, model: str, prompt: str
         return False
 
 
-def run_buffered_verification(client: ChatGPTCLIClient, model: str, prompt: str) -> bool:
+def run_buffered_verification(client: ChatGPTCLIClient, model: str, prompt: Union[str, List[Dict[str, Any]]]) -> bool:
     print(f"\n{color('--- [Running Buffered JSON Verification] ---', MAGENTA + BOLD)}")
     t0 = time.time()
     try:
@@ -256,18 +287,21 @@ def interactive_repl(
     print(f"  {color('API Endpoint  :', BOLD)} {client.base_url}")
     print(f"  {color('Status        :', BOLD)} {status_str} ({user_name})")
     print(f"  {color('Active Pool   :', BOLD)} {active_pool_count} active conversation slots")
-    print(f"  {color('Commands      :', BOLD)} /think [on|off], /model [name], /new, /exit")
+    print(f"  {color('Commands      :', BOLD)} /image <path|url>, /think [on|off], /model [name], /new, /exit")
     print(color("-" * 64, CYAN))
 
     current_model = initial_model
     thinking_on = initial_thinking
     current_session_id = None
     force_next_new = force_new
-    history: List[Dict[str, str]] = []
+    pending_image: Optional[str] = None
+    pending_image_name: Optional[str] = None
+    history: List[Dict[str, Any]] = []
 
     while True:
         try:
-            status_tag = f"[{color('Model: ' + current_model, GREEN)} | {color('Think: ' + ('ON' if thinking_on else 'OFF'), YELLOW)}]"
+            img_badge = f" | {color(f'Img: {pending_image_name}', MAGENTA)}" if pending_image and pending_image_name else ""
+            status_tag = f"[{color('Model: ' + current_model, GREEN)} | {color('Think: ' + ('ON' if thinking_on else 'OFF'), YELLOW)}{img_badge}]"
             prompt = input(f"\n{color('You', BOLD + CYAN)} {status_tag} > ").strip()
 
             if not prompt:
@@ -280,9 +314,33 @@ def interactive_repl(
             elif prompt.lower() in ('/new', '/clear', '/reset'):
                 history.clear()
                 current_session_id = None
+                pending_image = None
+                pending_image_name = None
                 force_next_new = True
                 client.new_session()
                 print(color("[✓] Fresh conversation thread initialized (history cleared).", GREEN))
+                continue
+
+            elif prompt.lower().startswith('/image'):
+                parts = prompt.split(maxsplit=1)
+                if len(parts) == 1:
+                    if pending_image_name:
+                        print(color(f"[i] Currently attached image: {pending_image_name}", CYAN))
+                    else:
+                        print(color("[i] No image attached. Usage: /image <file_path_or_url>", YELLOW))
+                    continue
+                sub = parts[1].strip()
+                if sub.lower() in ("clear", "none", "rm", "delete", "off"):
+                    pending_image = None
+                    pending_image_name = None
+                    print(color("[✓] Attached image cleared.", GREEN))
+                    continue
+                try:
+                    pending_image = encode_image_source(sub)
+                    pending_image_name = sub
+                    print(color(f"[✓] Image attached: {sub}. It will be sent with your next prompt.", GREEN))
+                except Exception as ex:
+                    print(color(f"[x] Error attaching image: {ex}", RED))
                 continue
 
             elif prompt.lower() == '/think on':
@@ -321,14 +379,26 @@ def interactive_repl(
 
             elif prompt.lower() == '/help':
                 print("Commands:")
-                print("  /think on|off  : Toggle GPT-5.6 reasoning (extended thinking)")
-                print("  /model <name>  : Switch model (or '/model' to list models)")
-                print("  /new           : Start a fresh chat thread in pool")
-                print("  /exit          : Exit client")
+                print("  /image <path|url> : Attach image to next prompt")
+                print("  /image clear      : Clear attached image")
+                print("  /think on|off     : Toggle GPT-5.6 reasoning (extended thinking)")
+                print("  /model <name>     : Switch model (or '/model' to list models)")
+                print("  /new              : Start a fresh chat thread in pool")
+                print("  /exit             : Exit client")
                 continue
 
-            # Append current turn to client history
-            history.append({"role": "user", "content": prompt})
+            # Construct message content (multimodal if image attached)
+            if pending_image:
+                user_msg_content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": pending_image}}
+                ]
+                pending_image = None
+                pending_image_name = None
+            else:
+                user_msg_content = prompt
+
+            history.append({"role": "user", "content": user_msg_content})
 
             in_think = False
             in_response = False
@@ -407,6 +477,11 @@ def main():
         help="Explicit prompt string (alternative to positional prompt)"
     )
     parser.add_argument(
+        "--image",
+        default=None,
+        help="Path or URL of an image to attach to the prompt"
+    )
+    parser.add_argument(
         "--api-url",
         default=DEFAULT_API_URL,
         help=f"API Base URL (default: {DEFAULT_API_URL})"
@@ -472,6 +547,16 @@ def main():
     if not thinking_on and model == "gpt-5-6-thinking":
         model = "gpt-5-6"
 
+    # Helper to build message content with optional image attachment
+    def build_user_content(prompt_text: str) -> Union[str, List[Dict[str, Any]]]:
+        if args.image:
+            img_uri = encode_image_source(args.image)
+            return [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": img_uri}}
+            ]
+        return prompt_text
+
     # 1. Verification mode: --both
     if args.both:
         prompt = args.prompt or args.explicit_prompt or "Berapa huruf r dalam kata strawberry? Tunjukkan analisis setiap huruf dan posisinya secara bertahap."
@@ -480,10 +565,15 @@ def main():
         print(f"{color('================================================================', MAGENTA)}")
         print(f"  Target URL : {client.base_url}")
         print(f"  Model      : {model}")
-        print(f"  Prompt     : {prompt}\n")
+        print(f"  Prompt     : {prompt}")
+        if args.image:
+            print(f"  Image      : {args.image}\n")
+        else:
+            print("\n")
 
-        ok1 = run_streaming_verification(client, model, prompt)
-        ok2 = run_buffered_verification(client, model, prompt)
+        test_payload = build_user_content(prompt)
+        ok1 = run_streaming_verification(client, model, test_payload)
+        ok2 = run_buffered_verification(client, model, test_payload)
         if ok1 and ok2:
             print(f"\n{color('ALL VERIFICATION CHECKS PASSED SUCCESSFULLY! ✓', GREEN + BOLD)}\n")
             sys.exit(0)
@@ -496,14 +586,18 @@ def main():
         prompt = args.prompt or args.explicit_prompt
         if not prompt:
             prompt = sys.stdin.read().strip()
-        if not prompt:
-            print(color("Prompt cannot be empty.", RED))
+        if not prompt and not args.image:
+            print(color("Prompt cannot be empty unless an image is provided.", RED))
             sys.exit(1)
+        if not prompt and args.image:
+            prompt = "Deskripsikan gambar ini secara detail."
+
+        user_content = build_user_content(prompt)
 
         if args.buffered:
             try:
                 res = client.buffered_chat(
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": user_content}],
                     model=model,
                     thinking=thinking_on,
                     session_id=args.session_id,
@@ -531,7 +625,7 @@ def main():
         in_think = False
         in_response = False
         try:
-            msgs = [{"role": "user", "content": prompt}]
+            msgs = [{"role": "user", "content": user_content}]
             for delta, _ in client.stream_chat(
                 messages=msgs,
                 model=model,

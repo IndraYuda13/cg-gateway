@@ -1,10 +1,22 @@
-from typing import List, Optional, Any, Union
+from typing import List, Optional, Any, Union, Dict
 from pydantic import BaseModel, Field
+
+
+class ImageUrlDetail(BaseModel):
+    url: str
+    detail: Optional[str] = "auto"
+
+
+class ContentPart(BaseModel):
+    type: str  # "text" or "image_url"
+    text: Optional[str] = None
+    image_url: Optional[Union[ImageUrlDetail, Dict[str, Any], str]] = None
+    model_config = {"extra": "allow"}
 
 
 class MessageItem(BaseModel):
     role: str
-    content: Union[str, List[Any]]
+    content: Union[str, List[Union[ContentPart, Dict[str, Any], str]]]
 
 
 class ChatCompletionRequest(BaseModel):

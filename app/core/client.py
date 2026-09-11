@@ -1,7 +1,8 @@
 import time
 import json
 import uuid
-from typing import Dict, Any, Optional, List, Generator
+import hashlib
+from typing import Dict, Any, Optional, List, Generator, Tuple
 from curl_cffi import requests
 
 from app.config import (
@@ -18,6 +19,52 @@ from app.core.pow import (
     build_proof_token,
     solve_turnstile_token
 )
+
+
+def inspect_image(data: bytes) -> Tuple[int, int, str]:
+    """
+    Inspects image bytes and returns (width, height, mime_type).
+    Uses PIL with graceful binary header fallback.
+    """
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(data))
+        w, h = img.size
+        fmt = (img.format or "").upper()
+        mime_map = {
+            "PNG": "image/png",
+            "JPEG": "image/jpeg",
+            "JPG": "image/jpeg",
+            "WEBP": "image/webp",
+            "GIF": "image/gif",
+            "BMP": "image/bmp",
+            "TIFF": "image/tiff"
+        }
+        mime = mime_map.get(fmt, "image/jpeg")
+        return w, h, mime
+    except Exception:
+        pass
+
+    # Header-based fallback
+    mime = "image/jpeg"
+    w, h = 1024, 1024
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+        if len(data) >= 24:
+            import struct
+            w, h = struct.unpack(">II", data[16:24])
+    elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    elif data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        mime = "image/gif"
+        if len(data) >= 10:
+            import struct
+            w, h = struct.unpack("<HH", data[6:10])
+    elif data.startswith(b"\xff\xd8"):
+        mime = "image/jpeg"
+
+    return w, h, mime
 
 
 class ChatRequirements:
@@ -55,6 +102,89 @@ class ChatGPTUpstreamClient:
 
         self.session = requests.Session(impersonate="edge101")
         self._setup_headers()
+        self._file_cache: Dict[str, Dict[str, Any]] = {}
+
+    def upload_file(
+        self,
+        file_bytes: bytes,
+        file_name: str,
+        mime_type: str,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        use_case: str = "multimodal"
+    ) -> Dict[str, Any]:
+        """
+        Executes the 3-phase upload lifecycle to ChatGPT Upstream:
+        1. POST /backend-api/files -> returns upload_url and file_id
+        2. PUT file_bytes to upload_url (Azure Blob Storage)
+        3. POST /backend-api/files/{file_id}/uploaded -> marks ready and gets download_url
+        """
+        # Deduplication check via SHA-256
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        if hasattr(self, "_file_cache") and file_hash in self._file_cache:
+            return self._file_cache[file_hash]
+
+        # Step 1: Initiate upload
+        init_url = f"{self.base_url}/backend-api/files"
+        init_payload = {
+            "file_name": file_name,
+            "file_size": len(file_bytes),
+            "use_case": use_case
+        }
+        init_resp = self.session.post(init_url, json=init_payload, timeout=30)
+        if init_resp.status_code != 200:
+            raise RuntimeError(
+                f"File upload initiation failed (HTTP {init_resp.status_code}): {init_resp.text[:300]}"
+            )
+
+        init_data = init_resp.json()
+        upload_url = init_data.get("upload_url")
+        file_id = init_data.get("file_id")
+        if not upload_url or not file_id:
+            raise RuntimeError(f"Missing upload_url or file_id in upload initiation: {init_data}")
+
+        # Step 2: PUT raw binary to upload_url (Azure Blob Storage)
+        # Note: Do NOT send ChatGPT session cookies/auth headers to Azure Blob Storage
+        put_headers = {
+            "Content-Type": mime_type,
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2020-04-08"
+        }
+        put_resp = requests.put(
+            upload_url,
+            data=file_bytes,
+            headers=put_headers,
+            timeout=60,
+            impersonate="edge101"
+        )
+        if put_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"File binary upload failed (HTTP {put_resp.status_code}): {put_resp.text[:300]}"
+            )
+
+        # Step 3: Finalize uploaded file
+        uploaded_url = f"{self.base_url}/backend-api/files/{file_id}/uploaded"
+        uploaded_resp = self.session.post(uploaded_url, json={}, timeout=30)
+        if uploaded_resp.status_code != 200:
+            raise RuntimeError(
+                f"File upload finalize failed (HTTP {uploaded_resp.status_code}): {uploaded_resp.text[:300]}"
+            )
+
+        uploaded_data = uploaded_resp.json()
+        download_url = uploaded_data.get("download_url")
+
+        result = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "size_bytes": len(file_bytes),
+            "mime_type": mime_type,
+            "width": width,
+            "height": height,
+            "download_url": download_url
+        }
+
+        self._file_cache[file_hash] = result
+        return result
 
     def _setup_headers(self) -> None:
         headers = {
@@ -208,7 +338,8 @@ class ChatGPTUpstreamClient:
         model: str = "gpt-5-6-thinking",
         parent_message_id: str = "client-created-root",
         conversation_id: Optional[str] = None,
-        thinking: Optional[bool] = None
+        thinking: Optional[bool] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Main streaming chat generator.
@@ -241,6 +372,59 @@ class ChatGPTUpstreamClient:
         msg_id = str(uuid.uuid4())
         is_thinking = ("thinking" in model.lower() or model.lower() in ("o3-pro", "gpt-5-6-pro", "gpt-6-pro")) if thinking is None else bool(thinking)
 
+        if attachments:
+            parts: List[Any] = []
+            attachments_meta: List[Dict[str, Any]] = []
+            for att in attachments:
+                fid = att.get("file_id") or att.get("id")
+                fname = att.get("file_name") or att.get("name") or "image.png"
+                size = att.get("size_bytes") or att.get("size") or 0
+                mime = att.get("mime_type", "image/png")
+                w = att.get("width")
+                h = att.get("height")
+                parts.append({
+                    "content_type": "image_asset_pointer",
+                    "asset_pointer": f"file-service://{fid}",
+                    "size_bytes": size,
+                    "width": w,
+                    "height": h
+                })
+                attachments_meta.append({
+                    "id": fid,
+                    "name": fname,
+                    "size": size,
+                    "mime_type": mime,
+                    "width": w,
+                    "height": h
+                })
+            if prompt:
+                parts.append(prompt)
+
+            content_payload = {
+                "content_type": "multimodal_text",
+                "parts": parts
+            }
+            metadata_payload = {
+                "selected_sources": [],
+                "selected_github_repos": [],
+                "selected_all_github_repos": False,
+                "serialization_metadata": {"custom_symbol_offsets": []},
+                "submission_mode": "manual_send",
+                "attachments": attachments_meta
+            }
+        else:
+            content_payload = {
+                "content_type": "text",
+                "parts": [prompt]
+            }
+            metadata_payload = {
+                "selected_sources": [],
+                "selected_github_repos": [],
+                "selected_all_github_repos": False,
+                "serialization_metadata": {"custom_symbol_offsets": []},
+                "submission_mode": "manual_send"
+            }
+
         payload: Dict[str, Any] = {
             "action": "next",
             "messages": [
@@ -248,17 +432,8 @@ class ChatGPTUpstreamClient:
                     "id": msg_id,
                     "author": {"role": "user"},
                     "create_time": time.time(),
-                    "content": {
-                        "content_type": "text",
-                        "parts": [prompt]
-                    },
-                    "metadata": {
-                        "selected_sources": [],
-                        "selected_github_repos": [],
-                        "selected_all_github_repos": False,
-                        "serialization_metadata": {"custom_symbol_offsets": []},
-                        "submission_mode": "manual_send"
-                    }
+                    "content": content_payload,
+                    "metadata": metadata_payload
                 }
             ],
             "parent_message_id": parent_message_id,
@@ -384,7 +559,8 @@ class ChatGPTUpstreamClient:
         model: str = "gpt-5-6-thinking",
         parent_message_id: str = "client-created-root",
         conversation_id: Optional[str] = None,
-        thinking: Optional[bool] = None
+        thinking: Optional[bool] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Synchronous non-streaming chat helper that consumes the stream and aggregates output.
@@ -399,7 +575,8 @@ class ChatGPTUpstreamClient:
             model=model,
             parent_message_id=parent_message_id,
             conversation_id=conversation_id,
-            thinking=thinking
+            thinking=thinking,
+            attachments=attachments
         ):
             e_type = event.get("type")
             if e_type == "text":

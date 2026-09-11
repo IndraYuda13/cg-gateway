@@ -1,7 +1,13 @@
+import os
 import time
 import uuid
 import json
-from typing import Optional, Any, Generator
+import base64
+import socket
+import ipaddress
+import urllib.request
+import urllib.parse
+from typing import Optional, Any, Generator, Tuple, List, Dict
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -12,7 +18,7 @@ from app.config import (
     DEFAULT_MODELS
 )
 from app.core.session import smart_pool
-from app.core.client import ChatGPTUpstreamClient
+from app.core.client import ChatGPTUpstreamClient, inspect_image
 from app.api.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -116,25 +122,203 @@ def new_session(
     }
 
 
+def process_image_source(image_src: str, client: ChatGPTUpstreamClient) -> Dict[str, Any]:
+    """
+    Decodes or downloads image bytes from base64 data URI, remote HTTP(S) URL, or local path.
+    Enforces SSRF prevention, 10s timeout, and 20MB limit.
+    Inspects image dimensions and uploads to ChatGPT upstream via client.upload_file.
+    """
+    src = (image_src or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="Empty image source provided")
+
+    img_bytes: bytes = b""
+    mime_type: str = "image/png"
+
+    # Case 1: Base64 data URI (e.g. data:image/png;base64,...)
+    if src.startswith("data:"):
+        try:
+            if "," in src:
+                header, b64_str = src.split(",", 1)
+                if ";" in header and ":" in header:
+                    mime_type = header.split(":", 1)[1].split(";", 1)[0].strip()
+                img_bytes = base64.b64decode(b64_str)
+            else:
+                img_bytes = base64.b64decode(src)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode base64 image: {str(e)}")
+
+    # Case 2: Remote HTTP/HTTPS URL
+    elif src.startswith("http://") or src.startswith("https://"):
+        parsed = urllib.parse.urlparse(src)
+        host = parsed.hostname
+        if not host:
+            raise HTTPException(status_code=400, detail="Invalid image URL host")
+
+        # SSRF Protection: Reject private/loopback/reserved IPs
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local:
+                raise HTTPException(status_code=400, detail=f"Blocked private/internal IP in image URL: {host}")
+        except ValueError:
+            # Host is domain name, resolve and check IP
+            try:
+                resolved_ip = socket.gethostbyname(host)
+                ip_obj = ipaddress.ip_address(resolved_ip)
+                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local:
+                    raise HTTPException(status_code=400, detail=f"Blocked internal resolution for host: {host} -> {resolved_ip}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to resolve image host {host}: {e}")
+
+        # Fetch with 10s timeout and 20MB limit
+        try:
+            req = urllib.request.Request(
+                src,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) cg-gateway/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content_len = resp.headers.get("Content-Length")
+                if content_len and int(content_len) > 20 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Image exceeds maximum allowed size of 20MB")
+                ct = resp.headers.get("Content-Type")
+                if ct and "/" in ct:
+                    mime_type = ct.split(";")[0].strip()
+                img_bytes = resp.read(20 * 1024 * 1024 + 1)
+                if len(img_bytes) > 20 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Image exceeds maximum allowed size of 20MB")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch image from URL: {str(e)}")
+
+    # Case 3: Local file path or file:// URI
+    else:
+        file_path = src[7:] if src.startswith("file://") else src
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    img_bytes = f.read(20 * 1024 * 1024 + 1)
+                    if len(img_bytes) > 20 * 1024 * 1024:
+                        raise HTTPException(status_code=400, detail="Local image exceeds 20MB limit")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to read local image file: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported image format or missing file")
+
+    if not img_bytes:
+        raise HTTPException(status_code=400, detail="Empty image data received")
+
+    width, height, detected_mime = inspect_image(img_bytes)
+    final_mime = detected_mime or mime_type
+    ext = final_mime.split("/")[-1] if "/" in final_mime else "png"
+    file_name = f"image_{uuid.uuid4().hex[:8]}.{ext}"
+
+    uploaded = client.upload_file(
+        file_bytes=img_bytes,
+        file_name=file_name,
+        mime_type=final_mime,
+        width=width,
+        height=height,
+        use_case="multimodal"
+    )
+    return uploaded
+
+
+def extract_prompt_and_attachments(
+    messages: List[Any],
+    client: ChatGPTUpstreamClient
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Extracts user prompt text and resolves any embedded image attachments from the latest user message.
+    """
+    last_user_msg = None
+    for m in reversed(messages):
+        role = getattr(m, "role", None) if hasattr(m, "role") else (m.get("role") if isinstance(m, dict) else None)
+        if role == "user":
+            last_user_msg = m
+            break
+
+    if not last_user_msg:
+        return "", []
+
+    content = getattr(last_user_msg, "content", None) if hasattr(last_user_msg, "content") else (last_user_msg.get("content") if isinstance(last_user_msg, dict) else None)
+    text_parts: List[str] = []
+    attachments: List[Dict[str, Any]] = []
+
+    if isinstance(content, str):
+        text_parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict):
+                p_type = part.get("type", "")
+                if p_type == "text":
+                    text_parts.append(part.get("text", ""))
+                elif p_type == "image_url":
+                    img_val = part.get("image_url")
+                    url_str = ""
+                    if isinstance(img_val, dict):
+                        url_str = img_val.get("url", "")
+                    elif isinstance(img_val, str):
+                        url_str = img_val
+                    if url_str:
+                        att = process_image_source(url_str, client)
+                        attachments.append(att)
+                elif p_type in ("image", "file"):
+                    src_str = part.get("image") or part.get("file") or part.get("url", "")
+                    if src_str:
+                        att = process_image_source(src_str, client)
+                        attachments.append(att)
+            elif hasattr(part, "type"):
+                p_type = getattr(part, "type")
+                if p_type == "text":
+                    text_parts.append(getattr(part, "text", "") or "")
+                elif p_type == "image_url":
+                    img_val = getattr(part, "image_url", None)
+                    url_str = ""
+                    if isinstance(img_val, dict):
+                        url_str = img_val.get("url", "")
+                    elif isinstance(img_val, str):
+                        url_str = img_val
+                    elif hasattr(img_val, "url"):
+                        url_str = getattr(img_val, "url")
+                    if url_str:
+                        att = process_image_source(url_str, client)
+                        attachments.append(att)
+
+    prompt = " ".join([t.strip() for t in text_parts if t.strip()])
+    if not prompt and attachments:
+        prompt = "Deskripsikan dan analisis gambar ini secara detail."
+
+    return prompt, attachments
+
+
 def sse_event_stream(
     req: ChatCompletionRequest,
     token: str,
     conv_id: str,
     session_id: str,
     parent_msg_id: str,
-    prompt: str
+    prompt: str,
+    attachments: Optional[List[Dict[str, Any]]] = None
 ) -> Generator[str, None, None]:
     created = int(time.time())
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     client = ChatGPTUpstreamClient(token=token)
 
     # Initial chunk with assistant role
+    active_session_id = req.session_id or session_id
     initial_chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": req.model,
-        "session_id": session_id,
+        "session_id": active_session_id,
         "choices": [
             {
                 "index": 0,
@@ -167,9 +351,11 @@ def sse_event_stream(
             model=req.model or "gpt-5-6-thinking",
             parent_message_id=parent_msg_id or "client-created-root",
             conversation_id=conv_id_for_upstream,
-            thinking=effective_thinking
+            thinking=effective_thinking,
+            attachments=attachments
         ):
             e_type = event.get("type")
+            current_sid = req.session_id or last_conv_id or session_id
 
             if e_type == "text":
                 content = event.get("content", "")
@@ -179,7 +365,7 @@ def sse_event_stream(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
-                        "session_id": last_conv_id or session_id,
+                        "session_id": current_sid,
                         "choices": [
                             {
                                 "index": 0,
@@ -198,7 +384,7 @@ def sse_event_stream(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
-                        "session_id": last_conv_id or session_id,
+                        "session_id": current_sid,
                         "choices": [
                             {
                                 "index": 0,
@@ -228,16 +414,19 @@ def sse_event_stream(
             smart_pool.update_parent(conv_id, last_msg_id)
 
     except Exception as e:
+        err_msg = str(e)
+        if "404" in err_msg or "not found" in err_msg.lower():
+            smart_pool.reset_conv(conv_id)
         err_chunk = {
             "id": chat_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": req.model,
-            "session_id": session_id,
+            "session_id": req.session_id or session_id,
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"content": f"\n\n[Error from upstream: {str(e)}]"},
+                    "delta": {"content": f"\n\n[Error from upstream: {err_msg}]"},
                     "finish_reason": "error"
                 }
             ]
@@ -250,7 +439,7 @@ def sse_event_stream(
         "object": "chat.completion.chunk",
         "created": created,
         "model": req.model,
-        "session_id": last_conv_id or session_id,
+        "session_id": req.session_id or last_conv_id or session_id,
         "choices": [
             {
                 "index": 0,
@@ -271,28 +460,14 @@ def chat_completions(
     token = authenticate(authorization)
     client = ChatGPTUpstreamClient(token=token)
 
-    # Extract user prompt
-    messages_dicts = [m.model_dump() for m in req.messages]
-    last_user_prompt = ""
-    for m in reversed(req.messages):
-        if m.role == "user":
-            c = m.content
-            if isinstance(c, str):
-                last_user_prompt = c
-            elif isinstance(c, list):
-                parts = []
-                for p in c:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        parts.append(p.get("text", ""))
-                    elif isinstance(p, str):
-                        parts.append(p)
-                last_user_prompt = " ".join(parts)
-            break
+    # Extract user prompt and any attached images
+    last_user_prompt, attachments = extract_prompt_and_attachments(req.messages, client)
 
-    if not last_user_prompt:
+    if not last_user_prompt and not attachments:
         raise HTTPException(status_code=400, detail="No user message found in request")
 
     # Compute conversation identity and pool entry
+    messages_dicts = [m.model_dump() for m in req.messages]
     conv_id = smart_pool.compute_conv_id(
         messages=messages_dicts,
         user=req.user,
@@ -317,7 +492,8 @@ def chat_completions(
                 conv_id=conv_id,
                 session_id=session_id,
                 parent_msg_id=parent_id_to_use,
-                prompt=last_user_prompt
+                prompt=last_user_prompt,
+                attachments=attachments
             ),
             media_type="text/event-stream"
         )
@@ -336,13 +512,30 @@ def chat_completions(
             elif effort in ("none", "low", "minimal", "off"):
                 effective_thinking = False
 
-        completion_res = client.chat_completion(
-            prompt=last_user_prompt,
-            model=req.model or "gpt-5-6-thinking",
-            parent_message_id=parent_id_to_use,
-            conversation_id=conv_id_for_upstream,
-            thinking=effective_thinking
-        )
+        try:
+            completion_res = client.chat_completion(
+                prompt=last_user_prompt,
+                model=req.model or "gpt-5-6-thinking",
+                parent_message_id=parent_id_to_use,
+                conversation_id=conv_id_for_upstream,
+                thinking=effective_thinking,
+                attachments=attachments
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                # Stale upstream conversation DAG - reset and retry once cleanly
+                smart_pool.reset_conv(conv_id)
+                completion_res = client.chat_completion(
+                    prompt=last_user_prompt,
+                    model=req.model or "gpt-5-6-thinking",
+                    parent_message_id="client-created-root",
+                    conversation_id=None,
+                    thinking=effective_thinking,
+                    attachments=attachments
+                )
+            else:
+                raise
 
         final_conv_id = completion_res.get("conversation_id")
         final_msg_id = completion_res.get("message_id")
@@ -358,12 +551,14 @@ def chat_completions(
         prompt_tok_est = max(1, len(last_user_prompt) // 4)
         comp_tok_est = max(1, len(content) // 4)
 
+        resp_session_id = req.session_id or session_id or final_conv_id
+
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
             object="chat.completion",
             created=int(time.time()),
             model=req.model or "gpt-5-6-thinking",
-            session_id=final_conv_id or session_id,
+            session_id=resp_session_id,
             choices=[
                 ChoiceItem(
                     index=0,
