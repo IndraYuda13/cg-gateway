@@ -2,14 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
-from app.config import DEBUG
 
 app = FastAPI(
     title="cg-gateway: ChatGPT OpenAI-Compatible API Proxy",
     description="Production-grade reverse gateway for chatgpt.com supporting OpenAI API SDK protocol, multi-turn Smart Session Pool, and Sentinel PoW bypass.",
     version="1.0.0",
-    docs_url="/docs" if DEBUG else None,
-    redoc_url="/redoc" if DEBUG else None
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 app.add_middleware(

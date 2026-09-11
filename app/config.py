@@ -22,7 +22,7 @@ if ENV_FILE.exists():
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip("'\"")
-                if k not in os.environ:
+                if v and k not in os.environ:
                     os.environ[k] = v
     except Exception:
         pass
