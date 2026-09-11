@@ -7,10 +7,21 @@ class ImageUrlDetail(BaseModel):
     detail: Optional[str] = "auto"
 
 
+class FileUrlDetail(BaseModel):
+    url: str
+    name: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
 class ContentPart(BaseModel):
-    type: str  # "text" or "image_url"
+    type: str  # "text", "image_url", "file_url", "file", "image"
     text: Optional[str] = None
     image_url: Optional[Union[ImageUrlDetail, Dict[str, Any], str]] = None
+    file_url: Optional[Union[FileUrlDetail, Dict[str, Any], str]] = None
+    file: Optional[Union[Dict[str, Any], str]] = None
+    image: Optional[Union[Dict[str, Any], str]] = None
+    name: Optional[str] = None
+    mime_type: Optional[str] = None
     model_config = {"extra": "allow"}
 
 
@@ -26,6 +37,7 @@ class ChatCompletionRequest(BaseModel):
     thinking: Optional[bool] = None
     reasoning_effort: Optional[str] = None
     thinking_effort: Optional[str] = None
+    history_and_training_disabled: Optional[bool] = True
     session_id: Optional[str] = None
     new_session: Optional[bool] = False
     user: Optional[str] = None
@@ -39,6 +51,7 @@ class SimpleChatRequest(BaseModel):
     thinking: Optional[bool] = None
     reasoning_effort: Optional[str] = None
     thinking_effort: Optional[str] = None
+    history_and_training_disabled: Optional[bool] = True
     stream: Optional[bool] = False
     new_session: Optional[bool] = False
     user: Optional[str] = None

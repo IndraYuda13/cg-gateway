@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import uuid
@@ -67,6 +68,51 @@ def inspect_image(data: bytes) -> Tuple[int, int, str]:
     return w, h, mime
 
 
+def guess_mime_type(filename_or_ext: str) -> str:
+    """
+    Infers MIME type from filename or extension.
+    """
+    ext = os.path.splitext(filename_or_ext)[1].lower() if "." in filename_or_ext else filename_or_ext.lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    mime_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".svg": "image/svg+xml",
+        ".tiff": "image/tiff",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".csv": "text/csv",
+        ".tsv": "text/tab-separated-values",
+        ".json": "application/json",
+        ".xml": "application/xml",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".py": "text/x-python",
+        ".js": "application/javascript",
+        ".ts": "application/typescript",
+        ".css": "text/css",
+        ".yaml": "application/x-yaml",
+        ".yml": "application/x-yaml",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".doc": "application/msword",
+        ".xls": "application/vnd.ms-excel",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".zip": "application/zip",
+        ".tar": "application/x-tar",
+        ".gz": "application/gzip",
+    }
+    return mime_map.get(ext, "application/octet-stream")
+
+
 class ChatRequirements:
     def __init__(
         self,
@@ -108,10 +154,10 @@ class ChatGPTUpstreamClient:
         self,
         file_bytes: bytes,
         file_name: str,
-        mime_type: str,
+        mime_type: Optional[str] = None,
         width: Optional[int] = None,
         height: Optional[int] = None,
-        use_case: str = "multimodal"
+        use_case: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Executes the 3-phase upload lifecycle to ChatGPT Upstream:
@@ -119,10 +165,29 @@ class ChatGPTUpstreamClient:
         2. PUT file_bytes to upload_url (Azure Blob Storage)
         3. POST /backend-api/files/{file_id}/uploaded -> marks ready and gets download_url
         """
-        # Deduplication check via SHA-256
+        if not mime_type:
+            mime_type = guess_mime_type(file_name)
+
+        if mime_type.startswith("image/"):
+            if width is None or height is None:
+                w, h, detected_mime = inspect_image(file_bytes)
+                width = width or w
+                height = height or h
+                if detected_mime:
+                    mime_type = detected_mime
+
+        if not use_case:
+            use_case = "multimodal" if mime_type.startswith("image/") else "my_files"
+
+        # Deduplication check via SHA-256 and use_case
         file_hash = hashlib.sha256(file_bytes).hexdigest()
+        cache_key = f"{file_hash}_{use_case}"
+        if hasattr(self, "_file_cache") and cache_key in self._file_cache:
+            return self._file_cache[cache_key]
         if hasattr(self, "_file_cache") and file_hash in self._file_cache:
-            return self._file_cache[file_hash]
+            cached = self._file_cache[file_hash]
+            if cached.get("use_case") == use_case:
+                return cached
 
         # Step 1: Initiate upload
         init_url = f"{self.base_url}/backend-api/files"
@@ -180,9 +245,11 @@ class ChatGPTUpstreamClient:
             "mime_type": mime_type,
             "width": width,
             "height": height,
+            "use_case": use_case,
             "download_url": download_url
         }
 
+        self._file_cache[cache_key] = result
         self._file_cache[file_hash] = result
         return result
 
@@ -282,7 +349,8 @@ class ChatGPTUpstreamClient:
         parent_message_id: str = "client-created-root",
         prompt: str = "",
         conversation_id: Optional[str] = None,
-        thinking: Optional[bool] = None
+        thinking: Optional[bool] = None,
+        history_and_training_disabled: bool = True
     ) -> str:
         """
         Prepares conversation context and retrieves the conduit token.
@@ -295,6 +363,7 @@ class ChatGPTUpstreamClient:
             "action": "next",
             "parent_message_id": parent_message_id,
             "model": model,
+            "history_and_training_disabled": history_and_training_disabled,
             "client_prepare_state": "success",
             "client_prepare_dispatch": "immediate",
             "client_prepare_source": "context_change",
@@ -339,7 +408,8 @@ class ChatGPTUpstreamClient:
         parent_message_id: str = "client-created-root",
         conversation_id: Optional[str] = None,
         thinking: Optional[bool] = None,
-        attachments: Optional[List[Dict[str, Any]]] = None
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        history_and_training_disabled: bool = True
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Main streaming chat generator.
@@ -355,7 +425,8 @@ class ChatGPTUpstreamClient:
             parent_message_id=parent_message_id,
             prompt=prompt,
             conversation_id=conversation_id,
-            thinking=thinking
+            thinking=thinking,
+            history_and_training_disabled=history_and_training_disabled
         )
 
         conv_url = f"{self.base_url}/backend-api/f/conversation"
@@ -377,28 +448,49 @@ class ChatGPTUpstreamClient:
             attachments_meta: List[Dict[str, Any]] = []
             for att in attachments:
                 fid = att.get("file_id") or att.get("id")
-                fname = att.get("file_name") or att.get("name") or "image.png"
+                fname = att.get("file_name") or att.get("name") or "file"
                 size = att.get("size_bytes") or att.get("size") or 0
-                mime = att.get("mime_type", "image/png")
+                mime = att.get("mime_type") or guess_mime_type(fname)
                 w = att.get("width")
                 h = att.get("height")
-                parts.append({
-                    "content_type": "image_asset_pointer",
-                    "asset_pointer": f"file-service://{fid}",
-                    "size_bytes": size,
-                    "width": w,
-                    "height": h
-                })
-                attachments_meta.append({
+                use_case = att.get("use_case")
+
+                # Image attachments get image_asset_pointer in parts
+                is_image = (use_case == "multimodal") or mime.startswith("image/")
+                if is_image:
+                    img_part: Dict[str, Any] = {
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": f"file-service://{fid}",
+                        "size_bytes": size
+                    }
+                    if w is not None and h is not None:
+                        img_part["width"] = w
+                        img_part["height"] = h
+                    parts.append(img_part)
+
+                # All attachments (images & documents) get metadata entry
+                meta_item: Dict[str, Any] = {
                     "id": fid,
                     "name": fname,
                     "size": size,
-                    "mime_type": mime,
-                    "width": w,
-                    "height": h
-                })
+                    "mime_type": mime
+                }
+                if w is not None and h is not None:
+                    meta_item["width"] = w
+                    meta_item["height"] = h
+                attachments_meta.append(meta_item)
+
             if prompt:
                 parts.append(prompt)
+            elif not any(isinstance(p, str) for p in parts):
+                has_docs = any(not (a.get("mime_type", "").startswith("image/") or a.get("use_case") == "multimodal") for a in attachments)
+                has_imgs = any(a.get("mime_type", "").startswith("image/") or a.get("use_case") == "multimodal" for a in attachments)
+                if has_docs and has_imgs:
+                    parts.append("Analisis dan jelaskan file dan gambar ini secara detail.")
+                elif has_docs:
+                    parts.append("Analisis dan ringkas dokumen ini secara detail.")
+                else:
+                    parts.append("Deskripsikan dan analisis gambar ini secara detail.")
 
             content_payload = {
                 "content_type": "multimodal_text",
@@ -438,6 +530,7 @@ class ChatGPTUpstreamClient:
             ],
             "parent_message_id": parent_message_id,
             "model": model,
+            "history_and_training_disabled": history_and_training_disabled,
             "client_prepare_state": "success",
             "timezone_offset_min": -420,
             "timezone": "Asia/Jakarta",
@@ -560,7 +653,8 @@ class ChatGPTUpstreamClient:
         parent_message_id: str = "client-created-root",
         conversation_id: Optional[str] = None,
         thinking: Optional[bool] = None,
-        attachments: Optional[List[Dict[str, Any]]] = None
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        history_and_training_disabled: bool = True
     ) -> Dict[str, Any]:
         """
         Synchronous non-streaming chat helper that consumes the stream and aggregates output.
@@ -576,7 +670,8 @@ class ChatGPTUpstreamClient:
             parent_message_id=parent_message_id,
             conversation_id=conversation_id,
             thinking=thinking,
-            attachments=attachments
+            attachments=attachments,
+            history_and_training_disabled=history_and_training_disabled
         ):
             e_type = event.get("type")
             if e_type == "text":
