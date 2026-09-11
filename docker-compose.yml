@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  cg-gateway:
+    build: .
+    container_name: cg-gateway
+    restart: unless-stopped
+    ports:
+      - "8560:8560"
+    environment:
+      - PORT=8560
+      - HOST=0.0.0.0
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - CG_BASE_URL=${CG_BASE_URL:-https://chatgpt.com}
+      - CG_ACCOUNT_ID=${CG_ACCOUNT_ID:-}
+      - CG_TOKEN=${CG_TOKEN:-}
+      - CG_COOKIES=${CG_COOKIES:-}
+      - MAX_SESSIONS=${MAX_SESSIONS:-10}
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data

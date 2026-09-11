@@ -1,155 +1,256 @@
-# cg-gateway
+# ⚡ cg-gateway
 
-**cg-gateway** is a high-performance, production-ready reverse API gateway that bridges OpenAI ChatGPT Web services with the standard OpenAI API SDK specification (`/v1/chat/completions`, `/v1/models`, `/health`).
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.109%2B-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20Compatible-412991.svg?logo=openai&logoColor=white)](https://platform.openai.com/docs/api-reference)
 
-It enables direct programmatic access to frontier models (including `gpt-5-6`, `gpt-5-6-thinking`, `gpt-5-5`, `gpt-5-5-thinking`, `gpt-5-6-pro`, `gpt-6-pro`, `o3-pro`, and `gpt-4o`) using standard OpenAI SDK clients, curl commands, or standalone terminal CLIs.
+High-performance, lightweight OpenAI-compatible reverse API gateway and interactive terminal client for upstream conversational endpoints (CG edition).
 
----
-
-## Key Features
-
-1. **OpenAI SDK Drop-in Compatibility**:
-   - Implements `/v1/chat/completions` supporting both Server-Sent Events (`stream: true`) and buffered JSON responses (`stream: false`).
-   - Parses and isolates `reasoning_content` (thinking tokens) alongside final assistant message content.
-   - Standard `/v1/models` endpoint for automated model discovery.
-
-2. **Full Sentinel & Anti-Bot Cryptographic Bypass**:
-   - **Legacy P-Token Generator**: Generates synthetic browser device fingerprints and high-resolution timing telemetry.
-   - **SHA3-512 Proof of Work (PoW) Solver**: High-speed pure Python solver matching dynamic difficulty challenges in ~0.003s.
-   - **Turnstile Bytecode Virtual Machine Solver**: Fully contained bytecode deobfuscator and VM emulator that unpacks and executes challenge routines in ~0.01s.
-   - **Two-Step Sentinel Handshake**: Automates `/prepare` and `/finalize` flows, maintaining an in-memory cached requirements token valid for ~9 minutes.
-   - **Browser TLS & HTTP/2 Impersonation**: Uses `curl_cffi` with Edge/Chrome TLS profiles to bypass Cloudflare anti-bot checks.
-
-3. **Smart Session Pool & Multi-Turn State Management**:
-   - **Context Fingerprinting**: Automatically groups conversation turns using SHA-256 digests of the root user prompt.
-   - **Parent Message Tracking**: Seamlessly tracks upstream `parent_message_id` and conversation IDs across sequential turns.
-   - **LRU Session Eviction**: Strictly bounds pool size (default: 10 active conversations) and triggers upstream background deletion of evicted chats to prevent sidebar pollution.
-   - **Auto-Healing**: Transparently creates replacement sessions if upstream sessions expire or encounter invalid states.
-
-4. **Pure Python Terminal Client**:
-   - Zero external dependencies CLI (`client/cg_cli.py` and `run_cli.py`).
-   - Supports interactive REPL mode with colored streaming and reasoning toggle (`--no-think`).
-   - Single-shot prompt CLI for shell scripts and automation pipelines.
+Engineered with sub-millisecond cryptographic challenge solvers, an intelligent Least-Recently-Used (LRU) session pool orchestrator that prevents workspace conversation clutter, and native streaming support for both fast responses and deep reasoning tokens (`reasoning_content`).
 
 ---
 
-## Architecture Overview
+## 🌟 Highlights
 
-```
-[ Client Application / OpenAI SDK / CLI ]
-                   │
-                   ▼ (HTTP / SSE on Port 8560)
-         [ cg-gateway (FastAPI) ]
-                   │
-   ┌───────────────┼───────────────┐
-   ▼               ▼               ▼
-[ app/api ]  [ app/core ]    [ app/core ]
-  Routes       Session Pool    PoW & Turnstile VM
-                   │               │
-                   └───────┬───────┘
-                           ▼
-              [ ChatGPTUpstreamClient ]
-                           │ (curl_cffi edge101 TLS)
-                           ▼
-          [ Upstream: https://chatgpt.com ]
-            ├─ POST /backend-api/sentinel/chat-requirements/prepare
-            ├─ POST /backend-api/sentinel/chat-requirements/finalize
-            ├─ POST /backend-api/f/conversation/prepare
-            ├─ POST /backend-api/f/conversation (SSE stream)
-            └─ PATCH /backend-api/conversation/{id} (LRU cleanup)
-```
+- ⚡ **High-Speed Challenge Resolution**:
+  - Pure Python SHA3-512 Proof-of-Work (PoW) solver matching dynamic difficulty challenges in ~0.003s.
+  - Fully self-contained Turnstile Bytecode Virtual Machine (VM) emulator executing challenges in ~0.01s.
+  - Two-stage sentinel handshake (`/prepare` and `/finalize`) with thread-safe cached token renewal.
+- 🔒 **Smart Session Pool & Multi-Turn State Management**:
+  - **Context Fingerprinting**: Groups sequential turns deterministically via SHA-256 root prompt digests.
+  - **Zero Workspace Clutter**: Eliminates orphaned chat sessions upstream by strictly bounding active conversation pools and triggering background deletion of evicted threads.
+  - **Auto-Healing Resilience**: Automatically detects invalidated or expired remote sessions and creates seamless replacements.
+- 🧠 **Frontier Model & Deep Reasoning Stream**:
+  - Full support for `gpt-5-6`, `gpt-5-6-thinking`, `gpt-5-5`, `gpt-5-5-thinking`, `gpt-5-6-pro`, `gpt-6-pro`, `o3-pro`, and `gpt-4o`.
+  - Isolates and streams reasoning tokens (`reasoning_content`) in real-time alongside final completion deltas.
+- 🔌 **Drop-in OpenAI SDK Compatibility**:
+  - Implements `/v1/chat/completions` (Server-Sent Events streaming and buffered JSON).
+  - Compatible with official `openai` Python and Node.js SDKs, LangChain, LobeChat, LibreChat, NextChat, and OpenWebUI.
+- 💻 **Zero-Dependency CLI & REPL**:
+  - Standalone terminal client powered 100% by the Python Standard Library (`urllib`, `json`, `argparse`).
+  - Interactive REPL with syntax coloring, reasoning toggle (`--no-think`), live model switching (`/model`), and session management (`/new`).
+- 🐳 **Production Packaging**:
+  - Pre-configured Docker, Docker Compose, and Systemd deployment service units.
 
 ---
 
-## Directory Structure
+## 📐 Architecture
 
 ```text
-/root/projects/cg-gateway/
+[ Client Applications / SDKs / CLI ]
+                │
+                ▼ (Standard OpenAI REST / SSE)
+    [ Reverse Proxy / CF Tunnel ]
+                │
+                ▼ (Port :8560)
+       [ cg-gateway (FastAPI) ]
+                │
+   ┌────────────┴────────────┐
+   ▼                         ▼
+[ app/api ]            [ app/core ]
+  - /health              - SmartSessionPool (LRU + Background Eviction)
+  - /v1/models           - PoW (SHA3-512) & Turnstile VM Solver
+  - /v1/chat/completions - ChatGPTUpstreamClient (curl_cffi TLS impersonation)
+                             │
+                             ▼ (HTTP/2 Server-Sent Events)
+                  [ Upstream Web Endpoint ]
+                    ├─ POST /backend-api/sentinel/chat-requirements/prepare
+                    ├─ POST /backend-api/sentinel/chat-requirements/finalize
+                    ├─ POST /backend-api/f/conversation/prepare
+                    ├─ POST /backend-api/f/conversation (SSE stream)
+                    └─ PATCH /backend-api/conversation/{id} (cleanup)
+```
+
+---
+
+## 📂 Repository Structure
+
+```text
+cg-gateway/
 ├── app/
 │   ├── __init__.py
-│   ├── config.py              # Configuration & credential loader
-│   ├── main.py                # FastAPI app initialization & CORS
+│   ├── config.py              # Environment configuration & credential manager
+│   ├── main.py                # FastAPI application & middleware initialization
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── routes.py          # /health, /v1/models, /v1/chat/completions
-│   │   └── schemas.py         # Pydantic OpenAI schema models
+│   │   └── schemas.py         # OpenAI Pydantic request/response schemas
 │   └── core/
 │       ├── __init__.py
-│       ├── client.py          # ChatGPTUpstreamClient & SSE stream parser
-│       ├── pow.py             # SHA3-512 PoW & Turnstile VM solver
+│       ├── client.py          # ChatGPTUpstreamClient & SSE parser
+│       ├── pow.py             # SHA3-512 PoW & Turnstile VM emulator
 │       └── session.py         # SmartSessionPool LRU state manager
 ├── client/
 │   ├── __init__.py
-│   └── cg_cli.py              # Standalone Python CLI & REPL
+│   ├── cg_cli.py              # Zero-dependency interactive CLI & REPL
+│   └── chatgpt_client.py      # Standalone verification tool & client
 ├── data/
-│   ├── credentials.json       # Extracted account credentials & cookies
-│   └── session_pool.json      # Persistent session cache
+│   └── .gitkeep               # Directory placeholder (credentials & sessions ignored)
 ├── systemd/
-│   └── cg-gateway.service     # Systemd production unit definition
-├── .env.example
-├── main.py                    # Gateway launch entrypoint
-├── requirements.txt           # Project dependencies
-├── run_cli.py                 # Convenience CLI launcher
-├── server.py                  # Uvicorn server launcher
-└── README.md
+│   └── cg-gateway.service     # Systemd production service definition
+├── tests/
+│   ├── __init__.py
+│   ├── test_api_multi_turn.py # Multi-turn API integration tests
+│   ├── test_cli_client.py     # CLI client unit tests
+│   ├── test_session_pool.py   # SmartSessionPool unit tests
+│   ├── test_smoke.py          # Smoke tests
+│   └── test_sse_parsing.py    # SSE stream decoder tests
+├── .env.example               # Environment variables template
+├── .gitignore                 # Strict git ignore definitions
+├── Dockerfile                 # Container image definition
+├── docker-compose.yml         # Container orchestration configuration
+├── LICENSE                    # MIT License
+├── main.py                    # Gateway launch entry point
+├── pyproject.toml             # Project metadata & build configuration
+├── requirements.txt           # Python package dependencies
+├── run_cli.py                 # CLI launcher shortcut
+└── server.py                  # Uvicorn server launcher
 ```
 
 ---
 
-## Quick Start
+## 🚀 Quickstart
 
-### 1. Installation
+### 1. Interactive Terminal Client (Zero External Dependencies)
 
-Ensure Python 3.10+ is installed:
+The included CLI uses only the Python Standard Library (`urllib`, `argparse`, `json`):
 
 ```bash
-cd /root/projects/cg-gateway
+# Clone the repository
+git clone https://github.com/IndraYuda13/cg-gateway.git
+cd cg-gateway
+
+# Launch interactive terminal REPL
+python3 run_cli.py
+
+# Or execute a single prompt directly
+python3 run_cli.py "Explain event-driven architecture in two sentences."
+
+# Disable extended reasoning for instant response
+python3 run_cli.py --no-think "What is the capital of Indonesia?"
+```
+
+Inside the interactive REPL:
+- Enter any prompt to stream response with real-time reasoning visualization.
+- `/new` or `/reset`: Clears conversation history and starts a fresh session.
+- `/model <slug>`: Dynamically switch target model (e.g., `/model gpt-5-6`).
+- `/exit` or `/quit`: Exits the client.
+
+---
+
+### 2. Self-Hosting (Local Machine or VPS)
+
+#### Prerequisites
+- Python 3.10+
+- `pip` package manager
+
+#### Setup & Execution
+```bash
+# 1. Clone repository
+git clone https://github.com/IndraYuda13/cg-gateway.git
+cd cg-gateway
+
+# 2. Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
-```
 
-### 2. Configuration
-
-Copy `.env.example` to `.env` if you need custom overrides:
-
-```bash
+# 4. Configure environment
 cp .env.example .env
-```
+# Edit .env and configure your credentials (see Upstream Credential Acquisition)
 
-Environment variables:
-- `PORT`: Gateway listening port (default: `8560`).
-- `HOST`: Gateway listening host (default: `0.0.0.0`).
-- `PROXY_API_KEY`: Optional security key required for gateway access.
-- `MAX_SESSIONS`: Maximum active conversational sessions before LRU eviction (default: `10`).
-- `CG_ACCOUNT_ID`: Target ChatGPT workspace / account UUID.
-
-Credentials can be supplied via environment variables (`CG_TOKEN`, `CG_COOKIES`) or stored in `data/credentials.json`.
-
-### 3. Running the Server
-
-Direct execution:
-```bash
+# 5. Start gateway server
 python3 server.py
 ```
-
-The gateway will start on `http://0.0.0.0:8560`.
+The gateway will start listening on `http://0.0.0.0:8560`.
 
 ---
 
-## API Usage
+### 3. Docker Deployment
 
-### Health Check
+Deploy with Docker Compose:
 
+```bash
+# Build and launch container in background
+docker compose up -d --build
+
+# Inspect live logs
+docker compose logs -f
+```
+
+To stop:
+```bash
+docker compose down
+```
+
+---
+
+### 4. Production Systemd Service
+
+For continuous background execution on Linux hosts:
+
+```bash
+# Copy systemd service unit
+sudo cp systemd/cg-gateway.service /etc/systemd/system/
+
+# Reload systemd daemon and enable service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cg-gateway
+
+# Verify service health & inspect logs
+sudo systemctl status cg-gateway
+sudo journalctl -u cg-gateway -f
+```
+
+---
+
+## 🔑 Upstream Credential Acquisition
+
+The gateway requires your active session authentication token and cookies from the upstream web service:
+
+1. Open your desktop browser and log into your account.
+2. Open Developer Tools (`F12` or `Ctrl + Shift + I`) and select the **Network** tab.
+3. Send any message in the chat interface.
+4. Filter requests by `conversation` or `chat-requirements`.
+5. Under **Request Headers**, copy:
+   - `authorization` token (e.g., `Bearer eyJhbGci...`)
+   - `cookie` header string
+6. Configure them either via `.env`:
+   ```bash
+   CG_TOKEN="eyJhbGciOi..."
+   CG_COOKIES="__Secure-next-auth.session-token=...; ..."
+   ```
+   Or place them in `data/credentials.json`:
+   ```json
+   {
+     "token": "eyJhbGciOi...",
+     "cookies": "__Secure-next-auth.session-token=...",
+     "account_id": "optional-workspace-uuid"
+   }
+   ```
+
+*(Note: `data/credentials.json` is strictly ignored by git and never committed).*
+
+---
+
+## 📡 API Reference
+
+### Health & Runtime Diagnostics
 ```bash
 curl -s http://127.0.0.1:8560/health | jq
 ```
 
-Response:
+**Response:**
 ```json
 {
   "status": "online",
   "service": "cg-gateway",
   "version": "1.0.0",
-  "account_id": "fb88ebc3-79ae-45ff-b8b1-2313efa099b4",
+  "account_id": "00000000-0000-0000-0000-000000000000",
   "models": [
     "gpt-5-6",
     "gpt-5-6-thinking",
@@ -158,29 +259,32 @@ Response:
     "gpt-5-6-pro",
     "gpt-6-pro",
     "o3-pro",
-    "gpt-4o"
+    "gpt-4o",
+    "gpt-4o-mini"
   ],
   "pool": {
     "active_conversations_count": 1,
     "max_pool_size": 10,
-    "conversations": [...]
+    "conversations": []
   },
   "account": {
-    "name": "csacsa",
-    "email": "10482807+notisations@utc2eduvn.onmicrosoft.com",
+    "name": "Workspace User",
+    "email": "user@example.com",
     "plan": "Enterprise / Workspace"
   }
 }
 ```
 
-### List Models
+---
 
+### Model Discovery
 ```bash
 curl -s http://127.0.0.1:8560/v1/models | jq
 ```
 
-### Chat Completion (Streaming)
+---
 
+### Chat Completions (Streaming SSE)
 ```bash
 curl -N http://127.0.0.1:8560/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -193,8 +297,9 @@ curl -N http://127.0.0.1:8560/v1/chat/completions \
   }'
 ```
 
-### Chat Completion (Non-Streaming)
+---
 
+### Chat Completions (Buffered JSON)
 ```bash
 curl -s http://127.0.0.1:8560/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -207,6 +312,8 @@ curl -s http://127.0.0.1:8560/v1/chat/completions \
   }' | jq
 ```
 
+---
+
 ### Using Official OpenAI Python SDK
 
 ```python
@@ -214,19 +321,20 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8560/v1",
-    api_key="lemon"  # or your PROXY_API_KEY
+    api_key="lemon"  # Matches PROXY_API_KEY if configured
 )
 
 response = client.chat.completions.create(
     model="gpt-5-6-thinking",
     messages=[
-        {"role": "user", "content": "Write a Python function to check prime numbers."}
+        {"role": "user", "content": "Write a concise Python function to check prime numbers."}
     ],
     stream=True
 )
 
 for chunk in response:
     delta = chunk.choices[0].delta
+    # Isolate deep reasoning stream if present
     if hasattr(delta, "reasoning_content") and delta.reasoning_content:
         print(delta.reasoning_content, end="", flush=True)
     if delta.content:
@@ -236,57 +344,23 @@ print()
 
 ---
 
-## Terminal Client (CLI)
+## 🧪 Verification & Testing
 
-The included CLI requires only standard Python libraries:
+The repository includes a comprehensive unit and integration test suite:
 
-### Single-shot Prompt:
 ```bash
-python3 run_cli.py "Summarize Newton's laws of motion"
+# Run test suite
+pytest tests/
 ```
 
-### Instant Mode (Disable Extended Reasoning):
-```bash
-python3 run_cli.py --no-think "What is the capital of Indonesia?"
-```
-
-### Interactive REPL Mode:
-```bash
-python3 run_cli.py
-```
-
-Inside the interactive REPL:
-- Type your prompt and press Enter.
-- `/new` or `/reset`: Clears multi-turn history and starts a fresh session.
-- `/model <slug>`: Switches target model on the fly.
-- `/exit`: Exits the client.
+All tests execute against mock fixtures and local logic, validating:
+- Multi-turn conversation continuity and parent message chaining.
+- CLI client streaming decoder and reasoning separation.
+- SmartSessionPool LRU eviction and memory bounds.
+- Upstream SSE protocol frame decoding.
 
 ---
 
-## Systemd Service Management
+## 📄 License
 
-To deploy `cg-gateway` as a background system daemon:
-
-1. Copy the service unit file:
-   ```bash
-   cp /root/projects/cg-gateway/systemd/cg-gateway.service /etc/systemd/system/
-   ```
-
-2. Reload systemd and start the service:
-   ```bash
-   systemctl daemon-reload
-   systemctl enable cg-gateway
-   systemctl start cg-gateway
-   ```
-
-3. Check service status and logs:
-   ```bash
-   systemctl status cg-gateway
-   journalctl -u cg-gateway -f
-   ```
-
----
-
-## License
-
-Internal proprietary research & integration gateway.
+This project is licensed under the [MIT License](LICENSE).

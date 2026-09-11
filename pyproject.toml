@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cg-gateway"
+version = "1.0.0"
+description = "Lightweight OpenAI-compatible conversational gateway and proxy interface (CG edition) with smart session pooling."
+authors = [{ name = "Indra Yuda", email = "indrayuda13@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.0.0",
+    "curl_cffi>=0.7.0",
+    "brotli>=1.1.0",
+]
+
+[project.scripts]
+cg-server = "server:main"
+cg-cli = "client.cg_cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+norecursedirs = ["tests/scratch", "scratch", ".git", ".pytest_cache"]

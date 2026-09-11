@@ -2,24 +2,32 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
-# Environments
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments & Local Config
 .env
 .venv/
 venv/
 ENV/
 
 # Data / Session State / Credentials
-data/
+data/*
+!data/.gitkeep
+data/session_pool.json
+data/credentials.json
 *.log
 *.tmp
 
-# Temporary diagnostic scripts in root only
-/test_*.py
-!/test_chatgpt_live.py
-cleanup_temp.py
+# Scratch / Diagnostic scripts
+tests/scratch/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
+.DS_Store
