@@ -150,7 +150,8 @@ class ChatGPTUpstreamClient:
         self,
         model: str,
         parent_message_id: str = "client-created-root",
-        prompt: str = ""
+        prompt: str = "",
+        conversation_id: Optional[str] = None
     ) -> str:
         """
         Prepares conversation context and retrieves the conduit token.
@@ -178,6 +179,8 @@ class ChatGPTUpstreamClient:
                 "web_push_notification_permission": "default"
             }
         }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         if is_thinking:
             payload["thinking_effort"] = "extended"
 
@@ -215,7 +218,12 @@ class ChatGPTUpstreamClient:
           - {"type": "done"}
         """
         requirements = self.get_chat_requirements()
-        conduit_token = self.prepare_conversation(model, parent_message_id, prompt)
+        conduit_token = self.prepare_conversation(
+            model=model,
+            parent_message_id=parent_message_id,
+            prompt=prompt,
+            conversation_id=conversation_id
+        )
 
         conv_url = f"{self.base_url}/backend-api/f/conversation"
         headers = {
@@ -335,6 +343,12 @@ class ChatGPTUpstreamClient:
                     i_val = item.get("v")
                     if i_path == "/message/content/parts/0" and i_op == "append" and isinstance(i_val, str):
                         yield {"type": "text", "content": i_val}
+                    elif (i_path == "" or i_path is None) and (i_op == "" or i_op is None) and isinstance(i_val, str):
+                        yield {"type": "text", "content": i_val}
+
+            # Standalone delta string token frame {"v": "..."} where p and o are omitted / empty / None
+            elif (path == "" or path is None) and (op == "" or op is None) and isinstance(val, str):
+                yield {"type": "text", "content": val}
 
             # Check for message structure updates
             elif isinstance(val, dict):

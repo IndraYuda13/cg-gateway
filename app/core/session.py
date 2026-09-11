@@ -82,6 +82,49 @@ class SmartSessionPool:
         except Exception as e:
             print(f"[SessionPool] Warning: Failed to save pool file: {e}")
 
+    def resolve_key(self, target_id: Optional[str]) -> Optional[str]:
+        """
+        Finds the canonical pool key for a given identifier, which may be:
+        1. An exact key in self.pool
+        2. An upstream session_id (entry.session_id)
+        3. A conv_id stored in an entry
+        4. A custom_ prefixed key or stripped custom_ key
+        """
+        if not target_id:
+            return None
+        sid = str(target_id).strip()
+        if not sid:
+            return None
+
+        # 1. Exact pool key
+        if sid in self.pool:
+            return sid
+
+        # 2. Match upstream session_id
+        for k, entry in self.pool.items():
+            if entry.session_id and entry.session_id == sid:
+                return k
+
+        # 3. Match entry conv_id
+        for k, entry in self.pool.items():
+            if entry.conv_id and entry.conv_id == sid:
+                return k
+
+        # 4. Check with/without "custom_" prefix
+        if sid.startswith("custom_"):
+            stripped = sid[7:]
+            if stripped in self.pool:
+                return stripped
+            for k, entry in self.pool.items():
+                if (entry.session_id and entry.session_id == stripped) or (entry.conv_id and entry.conv_id == stripped):
+                    return k
+        else:
+            custom_key = f"custom_{sid}"
+            if custom_key in self.pool:
+                return custom_key
+
+        return None
+
     def compute_conv_id(
         self,
         messages: List[Dict[str, Any]],
@@ -90,14 +133,23 @@ class SmartSessionPool:
     ) -> str:
         """
         Derives an immutable conversation identifier:
-        1. Explicit session ID passed in payload/header.
+        1. Explicit session ID passed in payload/header (resolved against existing pool).
         2. Standard OpenAI `user` parameter.
         3. Fingerprint of the root user message (remains constant across multi-turn chats).
         """
         if explicit_session_id:
-            return f"custom_{explicit_session_id.strip()}"
+            clean_sid = explicit_session_id.strip()
+            existing_key = self.resolve_key(clean_sid)
+            if existing_key:
+                return existing_key
+            return f"custom_{clean_sid}"
+
         if user and str(user).strip() not in ("", "none", "null"):
-            return f"user_{str(user).strip()}"
+            clean_user = str(user).strip()
+            existing_key = self.resolve_key(f"user_{clean_user}")
+            if existing_key:
+                return existing_key
+            return f"user_{clean_user}"
 
         # Fingerprint from the first user prompt in the messages array
         first_user_content = ""
@@ -110,7 +162,11 @@ class SmartSessionPool:
 
         if first_user_content:
             h = hashlib.sha256(first_user_content.encode("utf-8")).hexdigest()[:16]
-            return f"conv_{h}"
+            key = f"conv_{h}"
+            existing_key = self.resolve_key(key)
+            if existing_key:
+                return existing_key
+            return key
 
         return f"conv_anon_{int(time.time())}"
 
@@ -127,13 +183,23 @@ class SmartSessionPool:
         Returns: (session_id, parent_message_id)
         """
         now = time.time()
+        target_key = self.resolve_key(conv_id) or conv_id
 
-        if not force_new and conv_id in self.pool:
-            entry = self.pool[conv_id]
+        if not force_new and target_key in self.pool:
+            entry = self.pool[target_key]
             entry.last_active = now
             entry.turn_count += 1
             self.save()
             return entry.session_id, entry.parent_message_id or "client-created-root"
+
+        if force_new and target_key in self.pool:
+            entry = self.pool[target_key]
+            entry.session_id = None
+            entry.parent_message_id = "client-created-root"
+            entry.last_active = now
+            entry.turn_count = 1
+            self.save()
+            return None, "client-created-root"
 
         # Evict LRU session if capacity reached
         if len(self.pool) >= self.max_size:
@@ -147,9 +213,9 @@ class SmartSessionPool:
                     print(f"[SessionPool] Upstream delete error for {old_entry.session_id}: {e}")
 
         # Initialize fresh conversation entry
-        self.pool[conv_id] = SessionEntry(
+        self.pool[target_key] = SessionEntry(
             session_id=None,
-            conv_id=conv_id,
+            conv_id=target_key,
             parent_message_id="client-created-root",
             created_at=now,
             last_active=now,
@@ -159,20 +225,23 @@ class SmartSessionPool:
         return None, "client-created-root"
 
     def update_parent(self, conv_id: str, new_parent_id: Optional[str]) -> None:
-        if conv_id in self.pool and new_parent_id:
-            self.pool[conv_id].parent_message_id = new_parent_id
-            self.pool[conv_id].last_active = time.time()
+        key = self.resolve_key(conv_id) or conv_id
+        if key in self.pool and new_parent_id:
+            self.pool[key].parent_message_id = new_parent_id
+            self.pool[key].last_active = time.time()
             self.save()
 
     def update_session_id(self, conv_id: str, session_id: str) -> None:
-        if conv_id in self.pool and session_id:
-            self.pool[conv_id].session_id = session_id
-            self.pool[conv_id].last_active = time.time()
+        key = self.resolve_key(conv_id) or conv_id
+        if key in self.pool and session_id:
+            self.pool[key].session_id = session_id
+            self.pool[key].last_active = time.time()
             self.save()
 
     def reset_conv(self, conv_id: str, delete_fn: Optional[Callable[[str], bool]] = None) -> None:
-        if conv_id in self.pool:
-            old = self.pool.pop(conv_id)
+        key = self.resolve_key(conv_id) or conv_id
+        if key in self.pool:
+            old = self.pool.pop(key)
             self.save()
             if delete_fn and old.session_id:
                 try:
