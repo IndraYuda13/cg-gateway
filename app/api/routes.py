@@ -7,8 +7,9 @@ import socket
 import ipaddress
 import urllib.request
 import urllib.parse
-from typing import Optional, Any, Generator, Tuple, List, Dict
-from fastapi import APIRouter, Header, HTTPException
+import asyncio
+from typing import Optional, Any, AsyncGenerator, Tuple, List, Dict, Union
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.config import (
@@ -19,6 +20,15 @@ from app.config import (
 )
 from app.core.session import smart_pool
 from app.core.client import ChatGPTUpstreamClient, inspect_image, guess_mime_type
+from app.core.tools import (
+    generate_delimiters,
+    sanitize_user_prompt,
+    compile_tool_prompt,
+    extract_tool_calls_from_text,
+    format_tool_definitions
+)
+from app.core.stream_parser import LookaheadStreamParser
+from app.core.mcp_bridge import mcp_bridge, MCPSecurityError
 from app.api.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -26,10 +36,32 @@ from app.api.schemas import (
     ChatMessage,
     UsageInfo,
     ModelListResponse,
-    ModelItem
+    ModelItem,
+    ToolCall,
+    ToolCallFunction
 )
 
 router = APIRouter()
+
+
+def openai_error_response(
+    status_code: int,
+    message: str,
+    error_type: str = "invalid_request_error",
+    code: Optional[str] = None,
+    param: Optional[str] = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code
+            }
+        }
+    )
 
 
 def authenticate(authorization: Optional[str] = None) -> str:
@@ -120,6 +152,35 @@ def new_session(
         "conv_id": target_conv,
         "session_id": new_sid
     }
+
+
+@router.get("/v1/mcp/tools")
+def list_mcp_tools(authorization: Optional[str] = Header(default=None)):
+    authenticate(authorization)
+    try:
+        tools = mcp_bridge.list_tools()
+        return {"object": "list", "data": tools}
+    except Exception as e:
+        return openai_error_response(500, f"Failed to list MCP tools: {e}", error_type="mcp_error")
+
+
+@router.post("/v1/mcp/call")
+def call_mcp_tool(
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None)
+):
+    authenticate(authorization)
+    name = payload.get("name")
+    arguments = payload.get("arguments", {})
+    if not name:
+        return openai_error_response(400, "Missing tool 'name' in MCP call payload", code="invalid_tool_call")
+    try:
+        res = mcp_bridge.call_tool(name, arguments)
+        return {"status": "ok", "result": res}
+    except MCPSecurityError as se:
+        return openai_error_response(403, str(se), error_type="security_violation", code="mcp_sandbox_violation")
+    except Exception as e:
+        return openai_error_response(500, f"MCP execution error: {e}", error_type="mcp_error")
 
 
 def process_attachment_source(
@@ -290,9 +351,54 @@ def extract_prompt_and_attachments(
     client: ChatGPTUpstreamClient
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Extracts user prompt text and resolves any embedded image or document attachments from the latest user message.
-    Supports ContentPart types: text, image_url, file_url, file, image.
+    Extracts user prompt text or trailing role: 'tool' messages into upstream-compatible format,
+    and resolves any embedded image or document attachments.
     """
+    if not messages:
+        return "", []
+
+    # Check for trailing role: "tool" messages (Multi-Turn Function Calling Cycle)
+    trailing_tool_msgs = []
+    for m in reversed(messages):
+        role = getattr(m, "role", None) if hasattr(m, "role") else (m.get("role") if isinstance(m, dict) else None)
+        if role == "tool":
+            trailing_tool_msgs.append(m)
+        else:
+            break
+
+    if trailing_tool_msgs:
+        trailing_tool_msgs.reverse()
+        # Find assistant tool calls to resolve tool name if not provided on the tool message
+        assistant_calls_by_id: Dict[str, str] = {}
+        for m in messages:
+            role = getattr(m, "role", None) if hasattr(m, "role") else (m.get("role") if isinstance(m, dict) else None)
+            if role == "assistant":
+                tc_list = getattr(m, "tool_calls", None) if hasattr(m, "tool_calls") else (m.get("tool_calls") if isinstance(m, dict) else None)
+                if tc_list and isinstance(tc_list, list):
+                    for tc in tc_list:
+                        call_id = getattr(tc, "id", None) if hasattr(tc, "id") else (tc.get("id") if isinstance(tc, dict) else None)
+                        fn_obj = getattr(tc, "function", None) if hasattr(tc, "function") else (tc.get("function") if isinstance(tc, dict) else None)
+                        fn_name = getattr(fn_obj, "name", None) if hasattr(fn_obj, "name") else (fn_obj.get("name") if isinstance(fn_obj, dict) else None)
+                        if call_id and fn_name:
+                            assistant_calls_by_id[call_id] = fn_name
+
+        formatted_tool_parts: List[str] = []
+        for tm in trailing_tool_msgs:
+            t_call_id = getattr(tm, "tool_call_id", None) if hasattr(tm, "tool_call_id") else (tm.get("tool_call_id") if isinstance(tm, dict) else None)
+            t_name = getattr(tm, "name", None) if hasattr(tm, "name") else (tm.get("name") if isinstance(tm, dict) else None)
+            if not t_name and t_call_id:
+                t_name = assistant_calls_by_id.get(t_call_id, "function")
+            t_name = t_name or "function"
+            t_call_id = t_call_id or "call_unknown"
+            t_content = getattr(tm, "content", "") if hasattr(tm, "content") else (tm.get("content", "") if isinstance(tm, dict) else "")
+            if not isinstance(t_content, str):
+                t_content = json.dumps(t_content)
+            formatted_tool_parts.append(f"[Tool Result for {t_name} ({t_call_id})]: {t_content}")
+
+        tool_prompt = "\n\n".join(formatted_tool_parts)
+        return tool_prompt, []
+
+    # Standard User Message Extraction
     last_user_msg = None
     for m in reversed(messages):
         role = getattr(m, "role", None) if hasattr(m, "role") else (m.get("role") if isinstance(m, dict) else None)
@@ -399,21 +505,22 @@ def extract_prompt_and_attachments(
                         att = process_attachment_source(src_str, client, file_name=fname, mime_type=fmime)
                         attachments.append(att)
 
-    prompt = " ".join([t.strip() for t in text_parts if t.strip()])
-    if not prompt and attachments:
+    raw_prompt = " ".join([t.strip() for t in text_parts if t.strip()])
+    if not raw_prompt and attachments:
         has_docs = any(not (a.get("mime_type", "").startswith("image/") or a.get("use_case") == "multimodal") for a in attachments)
         has_imgs = any(a.get("mime_type", "").startswith("image/") or a.get("use_case") == "multimodal" for a in attachments)
         if has_docs and has_imgs:
-            prompt = "Analisis dan jelaskan file dan gambar ini secara detail."
+            raw_prompt = "Analisis dan jelaskan file dan gambar ini secara detail."
         elif has_docs:
-            prompt = "Analisis dan ringkas dokumen ini secara detail."
+            raw_prompt = "Analisis dan ringkas dokumen ini secara detail."
         else:
-            prompt = "Deskripsikan dan analisis gambar ini secara detail."
+            raw_prompt = "Deskripsikan dan analisis gambar ini secara detail."
 
+    prompt = sanitize_user_prompt(raw_prompt)
     return prompt, attachments
 
 
-def sse_event_stream(
+async def sse_event_stream(
     req: ChatCompletionRequest,
     token: str,
     conv_id: str,
@@ -421,14 +528,17 @@ def sse_event_stream(
     parent_msg_id: str,
     prompt: str,
     attachments: Optional[List[Dict[str, Any]]] = None,
-    history_and_training_disabled: bool = True
-) -> Generator[str, None, None]:
+    history_and_training_disabled: bool = True,
+    start_delimiter: Optional[str] = None,
+    end_delimiter: Optional[str] = None,
+    web_search: bool = False
+) -> AsyncGenerator[str, None]:
     created = int(time.time())
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     client = ChatGPTUpstreamClient(token=token)
 
-    # Initial chunk with assistant role
     active_session_id = req.session_id or session_id
+    current_sid = active_session_id
     initial_chunk = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -448,7 +558,6 @@ def sse_event_stream(
     last_conv_id = None
     last_msg_id = None
 
-    # Only supply conversation_id to upstream if this is turn >= 2 with established parent_message_id
     conv_id_for_upstream = None
     if parent_msg_id and parent_msg_id != "client-created-root":
         conv_id_for_upstream = session_id
@@ -461,6 +570,11 @@ def sse_event_stream(
         elif effort in ("none", "low", "minimal", "off"):
             effective_thinking = False
 
+    parser = LookaheadStreamParser(
+        start_delimiter=start_delimiter,
+        end_delimiter=end_delimiter
+    ) if (start_delimiter and end_delimiter) else None
+
     def stream_with_retry():
         nonlocal conv_id_for_upstream, parent_msg_id
         try:
@@ -471,13 +585,13 @@ def sse_event_stream(
                 conversation_id=conv_id_for_upstream,
                 thinking=effective_thinking,
                 attachments=attachments,
-                history_and_training_disabled=history_and_training_disabled
+                history_and_training_disabled=history_and_training_disabled,
+                web_search=web_search
             ):
                 yield ev
         except Exception as ex:
             err_str = str(ex)
             if ("404" in err_str or "not found" in err_str.lower()) and conv_id_for_upstream is not None:
-                # Upstream conversation expired or pruned - reset and retry turn fresh
                 smart_pool.reset_conv(conv_id)
                 for ev in client.stream_chat(
                     prompt=prompt,
@@ -486,72 +600,112 @@ def sse_event_stream(
                     conversation_id=None,
                     thinking=effective_thinking,
                     attachments=attachments,
-                    history_and_training_disabled=history_and_training_disabled
+                    history_and_training_disabled=history_and_training_disabled,
+                    web_search=web_search
                 ):
                     yield ev
             else:
                 raise
 
     try:
-        for event in stream_with_retry():
-            e_type = event.get("type")
-            current_sid = req.session_id or last_conv_id or session_id
+        async with smart_pool.get_lock(conv_id):
+            for event in stream_with_retry():
+                e_type = event.get("type")
+                current_sid = req.session_id or last_conv_id or session_id
 
-            if e_type == "text":
-                content = event.get("content", "")
-                if content:
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "session_id": current_sid,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": content},
-                                "finish_reason": None
+                if e_type == "text":
+                    content = event.get("content", "")
+                    if content:
+                        if parser:
+                            parsed_events = parser.feed(content)
+                            for pe in parsed_events:
+                                if pe["type"] == "text" and pe["content"]:
+                                    chunk = {
+                                        "id": chat_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": req.model,
+                                        "session_id": current_sid,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {"content": pe["content"]},
+                                                "finish_reason": None
+                                            }
+                                        ]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
+                                elif pe["type"] == "tool_call_delta":
+                                    chunk = {
+                                        "id": chat_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": req.model,
+                                        "session_id": current_sid,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": pe["delta"],
+                                                "finish_reason": None
+                                            }
+                                        ]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
+                        else:
+                            chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": req.model,
+                                "session_id": current_sid,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": content},
+                                        "finish_reason": None
+                                    }
+                                ]
                             }
-                        ]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                            yield f"data: {json.dumps(chunk)}\n\n"
 
-            elif e_type == "reasoning":
-                reasoning = event.get("reasoning", "")
-                if reasoning:
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "session_id": current_sid,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"reasoning_content": reasoning},
-                                "finish_reason": None
-                            }
-                        ]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif e_type == "reasoning":
+                    reasoning = event.get("reasoning", "")
+                    if reasoning:
+                        chunk = {
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "session_id": current_sid,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"reasoning_content": reasoning},
+                                    "finish_reason": None
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
-            elif e_type == "meta":
-                if event.get("conversation_id"):
-                    last_conv_id = event["conversation_id"]
-                if event.get("message_id"):
-                    last_msg_id = event["message_id"]
+                elif e_type == "meta":
+                    if event.get("conversation_id"):
+                        last_conv_id = event["conversation_id"]
+                    if event.get("message_id"):
+                        last_msg_id = event["message_id"]
 
-            elif e_type == "done":
-                if event.get("conversation_id"):
-                    last_conv_id = event["conversation_id"]
-                if event.get("message_id"):
-                    last_msg_id = event["message_id"]
+                elif e_type == "done":
+                    if event.get("conversation_id"):
+                        last_conv_id = event["conversation_id"]
+                    if event.get("message_id"):
+                        last_msg_id = event["message_id"]
 
-        # Update smart pool state with returned upstream conversation and message ids
-        if last_conv_id:
-            smart_pool.update_session_id(conv_id, last_conv_id)
-        if last_msg_id:
-            smart_pool.update_parent(conv_id, last_msg_id)
+                await asyncio.sleep(0)
+
+            # Update smart pool state with returned upstream conversation and message ids
+            if last_conv_id:
+                smart_pool.update_session_id(conv_id, last_conv_id)
+            if last_msg_id:
+                smart_pool.update_parent(conv_id, last_msg_id)
 
     except Exception as e:
         err_msg = str(e)
@@ -573,6 +727,45 @@ def sse_event_stream(
         }
         yield f"data: {json.dumps(err_chunk)}\n\n"
 
+    # Flush parser and determine terminal finish_reason
+    finish_reason = "stop"
+    if parser:
+        final_events = parser.finish()
+        for pe in final_events:
+            if pe["type"] == "text" and pe["content"]:
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "session_id": current_sid,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": pe["content"]},
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+            elif pe["type"] == "tool_call_delta":
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "session_id": current_sid,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": pe["delta"],
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+        finish_reason = parser.finish_reason
+
     # Terminal completion chunk
     final_chunk = {
         "id": chat_id,
@@ -584,7 +777,7 @@ def sse_event_stream(
             {
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop"
+                "finish_reason": finish_reason
             }
         ]
     }
@@ -593,18 +786,58 @@ def sse_event_stream(
 
 
 @router.post("/v1/chat/completions")
-def chat_completions(
+async def chat_completions(
     req: ChatCompletionRequest,
     authorization: Optional[str] = Header(default=None)
 ):
     token = authenticate(authorization)
     client = ChatGPTUpstreamClient(token=token)
 
-    # Extract user prompt and any attached files or images
-    last_user_prompt, attachments = extract_prompt_and_attachments(req.messages, client)
+    # Validate tools if provided
+    has_tools = bool(req.tools and len(req.tools) > 0)
+    start_delim: Optional[str] = None
+    end_delim: Optional[str] = None
+    tool_sys_prompt: str = ""
 
-    if not last_user_prompt and not attachments:
-        raise HTTPException(status_code=400, detail="No user message found in request")
+    if has_tools:
+        try:
+            _, start_delim, end_delim = generate_delimiters()
+            tool_sys_prompt = compile_tool_prompt(
+                tools=req.tools,  # type: ignore
+                tool_choice=req.tool_choice,
+                start_delimiter=start_delim,
+                end_delimiter=end_delim,
+                parallel_tool_calls=req.parallel_tool_calls
+            )
+        except Exception as e:
+            return openai_error_response(400, f"Invalid tools definition: {e}", code="invalid_tool_schema")
+
+    # Extract user prompt / tool results and any attached files or images
+    extracted_prompt, attachments = extract_prompt_and_attachments(req.messages, client)
+
+    if not extracted_prompt and not attachments:
+        return openai_error_response(400, "No valid user or tool message found in request")
+
+    # Prepend any system messages from request
+    system_parts: List[str] = []
+    for m in req.messages:
+        role = getattr(m, "role", None) if hasattr(m, "role") else (m.get("role") if isinstance(m, dict) else None)
+        if role == "system":
+            c = getattr(m, "content", "") if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
+            if isinstance(c, str) and c.strip():
+                system_parts.append(c.strip())
+
+    combined_sys = "\n\n".join(system_parts)
+    prefix_instructions = []
+    if combined_sys:
+        prefix_instructions.append(combined_sys)
+    if tool_sys_prompt:
+        prefix_instructions.append(tool_sys_prompt)
+
+    if prefix_instructions:
+        prompt_to_send = "\n\n".join(prefix_instructions) + "\n\n" + extracted_prompt
+    else:
+        prompt_to_send = extracted_prompt
 
     incognito_mode = req.history_and_training_disabled if req.history_and_training_disabled is not None else True
 
@@ -634,9 +867,12 @@ def chat_completions(
                 conv_id=conv_id,
                 session_id=session_id,
                 parent_msg_id=parent_id_to_use,
-                prompt=last_user_prompt,
+                prompt=prompt_to_send,
                 attachments=attachments,
-                history_and_training_disabled=incognito_mode
+                history_and_training_disabled=incognito_mode,
+                start_delimiter=start_delim,
+                end_delimiter=end_delim,
+                web_search=bool(req.web_search)
             ),
             media_type="text/event-stream"
         )
@@ -655,47 +891,73 @@ def chat_completions(
             elif effort in ("none", "low", "minimal", "off"):
                 effective_thinking = False
 
-        try:
-            completion_res = client.chat_completion(
-                prompt=last_user_prompt,
-                model=req.model or "gpt-5-6-thinking",
-                parent_message_id=parent_id_to_use,
-                conversation_id=conv_id_for_upstream,
-                thinking=effective_thinking,
-                attachments=attachments,
-                history_and_training_disabled=incognito_mode
-            )
-        except Exception as e:
-            err_msg = str(e)
-            if "404" in err_msg or "not found" in err_msg.lower():
-                # Stale upstream conversation DAG - reset and retry once cleanly
-                smart_pool.reset_conv(conv_id)
-                completion_res = client.chat_completion(
-                    prompt=last_user_prompt,
+        async with smart_pool.get_lock(conv_id):
+            try:
+                completion_res = await asyncio.to_thread(
+                    client.chat_completion,
+                    prompt=prompt_to_send,
                     model=req.model or "gpt-5-6-thinking",
-                    parent_message_id="client-created-root",
-                    conversation_id=None,
+                    parent_message_id=parent_id_to_use,
+                    conversation_id=conv_id_for_upstream,
                     thinking=effective_thinking,
                     attachments=attachments,
-                    history_and_training_disabled=incognito_mode
+                    history_and_training_disabled=incognito_mode,
+                    web_search=bool(req.web_search)
                 )
-            else:
-                raise
+            except Exception as e:
+                err_msg = str(e)
+                if "404" in err_msg or "not found" in err_msg.lower():
+                    smart_pool.reset_conv(conv_id)
+                    completion_res = await asyncio.to_thread(
+                        client.chat_completion,
+                        prompt=prompt_to_send,
+                        model=req.model or "gpt-5-6-thinking",
+                        parent_message_id="client-created-root",
+                        conversation_id=None,
+                        thinking=effective_thinking,
+                        attachments=attachments,
+                        history_and_training_disabled=incognito_mode,
+                        web_search=bool(req.web_search)
+                    )
+                else:
+                    raise
 
-        final_conv_id = completion_res.get("conversation_id")
-        final_msg_id = completion_res.get("message_id")
+            final_conv_id = completion_res.get("conversation_id")
+            final_msg_id = completion_res.get("message_id")
 
-        if final_conv_id:
-            smart_pool.update_session_id(conv_id, final_conv_id)
-        if final_msg_id:
-            smart_pool.update_parent(conv_id, final_msg_id)
+            if final_conv_id:
+                smart_pool.update_session_id(conv_id, final_conv_id)
+            if final_msg_id:
+                smart_pool.update_parent(conv_id, final_msg_id)
 
-        content = completion_res.get("content", "")
+        raw_content = completion_res.get("content", "")
         reasoning_content = completion_res.get("reasoning_content")
 
-        prompt_tok_est = max(1, len(last_user_prompt) // 4)
-        comp_tok_est = max(1, len(content) // 4)
+        tool_calls_objs: Optional[List[ToolCall]] = None
+        finish_reason = "stop"
+        content_to_return: Optional[str] = raw_content
 
+        if start_delim and end_delim:
+            cleaned_text, extracted_calls = extract_tool_calls_from_text(raw_content, start_delim, end_delim)
+            if extracted_calls:
+                tool_calls_objs = [
+                    ToolCall(
+                        id=tc["id"],
+                        type="function",
+                        function=ToolCallFunction(
+                            name=tc["function"]["name"],
+                            arguments=tc["function"]["arguments"]
+                        )
+                    )
+                    for tc in extracted_calls
+                ]
+                finish_reason = "tool_calls"
+                content_to_return = cleaned_text if cleaned_text else None
+            else:
+                content_to_return = raw_content
+
+        prompt_tok_est = max(1, len(prompt_to_send) // 4)
+        comp_tok_est = max(1, len(raw_content) // 4)
         resp_session_id = req.session_id or session_id or final_conv_id
 
         return ChatCompletionResponse(
@@ -709,10 +971,11 @@ def chat_completions(
                     index=0,
                     message=ChatMessage(
                         role="assistant",
-                        content=content,
-                        reasoning_content=reasoning_content
+                        content=content_to_return,
+                        reasoning_content=reasoning_content,
+                        tool_calls=tool_calls_objs
                     ),
-                    finish_reason="stop"
+                    finish_reason=finish_reason
                 )
             ],
             usage=UsageInfo(
@@ -722,4 +985,4 @@ def chat_completions(
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upstream error: {str(e)}")
+        return openai_error_response(500, f"Upstream error: {str(e)}", error_type="upstream_error")

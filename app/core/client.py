@@ -409,7 +409,8 @@ class ChatGPTUpstreamClient:
         conversation_id: Optional[str] = None,
         thinking: Optional[bool] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
-        history_and_training_disabled: bool = True
+        history_and_training_disabled: bool = True,
+        web_search: bool = False
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Main streaming chat generator.
@@ -443,6 +444,7 @@ class ChatGPTUpstreamClient:
         msg_id = str(uuid.uuid4())
         is_thinking = ("thinking" in model.lower() or model.lower() in ("o3-pro", "gpt-5-6-pro", "gpt-6-pro")) if thinking is None else bool(thinking)
 
+        selected_sources = ["web"] if web_search else []
         if attachments:
             parts: List[Any] = []
             attachments_meta: List[Dict[str, Any]] = []
@@ -497,7 +499,7 @@ class ChatGPTUpstreamClient:
                 "parts": parts
             }
             metadata_payload = {
-                "selected_sources": [],
+                "selected_sources": selected_sources,
                 "selected_github_repos": [],
                 "selected_all_github_repos": False,
                 "serialization_metadata": {"custom_symbol_offsets": []},
@@ -510,7 +512,7 @@ class ChatGPTUpstreamClient:
                 "parts": [prompt]
             }
             metadata_payload = {
-                "selected_sources": [],
+                "selected_sources": selected_sources,
                 "selected_github_repos": [],
                 "selected_all_github_repos": False,
                 "serialization_metadata": {"custom_symbol_offsets": []},
@@ -624,6 +626,11 @@ class ChatGPTUpstreamClient:
             elif ("reasoning" in str(path) or "thought" in str(path)) and isinstance(val, str):
                 yield {"type": "reasoning", "reasoning": val}
 
+            # Upstream tool / browsing / python recipient update
+            elif path in ("/message/recipient", "/message/author/name") and isinstance(val, str):
+                if val in ("web", "python", "dalle", "browser"):
+                    yield {"type": "upstream_tool", "tool": val, "content": ""}
+
             # Check for message structure updates
             elif isinstance(val, dict):
                 msg_obj = val.get("message", {})
@@ -644,6 +651,15 @@ class ChatGPTUpstreamClient:
                         if recap_text:
                             yield {"type": "reasoning", "reasoning": recap_text}
 
+                    # Handle upstream browsing and python tool events
+                    recipient = msg_obj.get("recipient") or msg_obj.get("author", {}).get("name")
+                    if recipient in ("web", "python", "dalle", "browser") or c_type in ("tether_browsing_display", "tether_quote", "code", "execution_output"):
+                        tool_name = recipient or ("web" if "tether" in str(c_type) else "python")
+                        tool_text = content_obj.get("text") or content_obj.get("result") or ""
+                        if not tool_text and isinstance(content_obj.get("parts"), list):
+                            tool_text = "".join(str(p) for p in content_obj.get("parts", []))
+                        yield {"type": "upstream_tool", "tool": tool_name, "content": tool_text, "content_type": c_type}
+
         yield {"type": "done", "conversation_id": last_conv_id, "message_id": last_msg_id}
 
     def chat_completion(
@@ -654,7 +670,8 @@ class ChatGPTUpstreamClient:
         conversation_id: Optional[str] = None,
         thinking: Optional[bool] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
-        history_and_training_disabled: bool = True
+        history_and_training_disabled: bool = True,
+        web_search: bool = False
     ) -> Dict[str, Any]:
         """
         Synchronous non-streaming chat helper that consumes the stream and aggregates output.
@@ -671,7 +688,8 @@ class ChatGPTUpstreamClient:
             conversation_id=conversation_id,
             thinking=thinking,
             attachments=attachments,
-            history_and_training_disabled=history_and_training_disabled
+            history_and_training_disabled=history_and_training_disabled,
+            web_search=web_search
         ):
             e_type = event.get("type")
             if e_type == "text":

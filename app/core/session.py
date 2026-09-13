@@ -1,6 +1,7 @@
 import time
 import json
 import hashlib
+import asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable, Tuple
 
@@ -60,7 +61,18 @@ class SmartSessionPool:
         self.file_path = Path(file_path)
         self.max_size = max(1, max_size)
         self.pool: Dict[str, SessionEntry] = {}  # conv_id -> SessionEntry
+        self._locks: Dict[str, asyncio.Lock] = {}
         self.load()
+
+    def get_lock(self, conv_id: str) -> asyncio.Lock:
+        """
+        Returns or creates a session-scoped asyncio.Lock mutex for the conversation
+        to eliminate concurrent race conditions.
+        """
+        key = self.resolve_key(conv_id) or conv_id
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     def load(self) -> None:
         if self.file_path.exists():
@@ -155,6 +167,13 @@ class SmartSessionPool:
         first_user_content = ""
         for m in messages:
             if m.get("role") == "user":
+                c = m.get("content", "")
+                if isinstance(c, str) and c.strip():
+                    first_user_content = c.strip()
+                    break
+
+        if not first_user_content:
+            for m in messages:
                 c = m.get("content", "")
                 if isinstance(c, str) and c.strip():
                     first_user_content = c.strip()

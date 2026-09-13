@@ -5,12 +5,14 @@ from pydantic import BaseModel, Field
 class ImageUrlDetail(BaseModel):
     url: str
     detail: Optional[str] = "auto"
+    model_config = {"extra": "allow"}
 
 
 class FileUrlDetail(BaseModel):
     url: str
     name: Optional[str] = None
     mime_type: Optional[str] = None
+    model_config = {"extra": "allow"}
 
 
 class ContentPart(BaseModel):
@@ -25,9 +27,39 @@ class ContentPart(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    model_config = {"extra": "allow"}
+
+
+class ToolDefinition(BaseModel):
+    type: str = "function"
+    function: Optional[FunctionDefinition] = None
+    model_config = {"extra": "allow"}
+
+
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+    model_config = {"extra": "allow"}
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+    model_config = {"extra": "allow"}
+
+
 class MessageItem(BaseModel):
     role: str
-    content: Union[str, List[Union[ContentPart, Dict[str, Any], str]]]
+    content: Optional[Union[str, List[Union[ContentPart, Dict[str, Any], str]]]] = ""
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Union[ToolCall, Dict[str, Any]]]] = None
+    model_config = {"extra": "allow"}
 
 
 class ChatCompletionRequest(BaseModel):
@@ -43,6 +75,11 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     temperature: Optional[float] = 1.0
     max_tokens: Optional[int] = None
+    tools: Optional[List[Union[ToolDefinition, Dict[str, Any]]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    parallel_tool_calls: Optional[bool] = True
+    web_search: Optional[bool] = False
+    model_config = {"extra": "allow"}
 
 
 class SimpleChatRequest(BaseModel):
@@ -56,24 +93,29 @@ class SimpleChatRequest(BaseModel):
     new_session: Optional[bool] = False
     user: Optional[str] = None
     session_id: Optional[str] = None
+    model_config = {"extra": "allow"}
 
 
 class ChatMessage(BaseModel):
     role: str = "assistant"
-    content: str
+    content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    model_config = {"extra": "allow"}
 
 
 class ChoiceItem(BaseModel):
     index: int = 0
     message: ChatMessage
-    finish_reason: str = "stop"
+    finish_reason: Optional[str] = "stop"
+    model_config = {"extra": "allow"}
 
 
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    model_config = {"extra": "allow"}
 
 
 class ChatCompletionResponse(BaseModel):
@@ -84,6 +126,46 @@ class ChatCompletionResponse(BaseModel):
     session_id: Optional[str] = None
     choices: List[ChoiceItem]
     usage: UsageInfo
+    model_config = {"extra": "allow"}
+
+
+class ToolCallDeltaFunction(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+    model_config = {"extra": "allow"}
+
+
+class ToolCallDelta(BaseModel):
+    index: int
+    id: Optional[str] = None
+    type: Optional[str] = "function"
+    function: Optional[ToolCallDeltaFunction] = None
+    model_config = {"extra": "allow"}
+
+
+class ChatCompletionChunkDelta(BaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCallDelta]] = None
+    model_config = {"extra": "allow"}
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int = 0
+    delta: ChatCompletionChunkDelta
+    finish_reason: Optional[str] = None
+    model_config = {"extra": "allow"}
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    session_id: Optional[str] = None
+    choices: List[ChatCompletionChunkChoice]
+    model_config = {"extra": "allow"}
 
 
 class ModelItem(BaseModel):
@@ -93,8 +175,10 @@ class ModelItem(BaseModel):
     owned_by: str = "openai"
     root: str
     parent: Optional[str] = None
+    model_config = {"extra": "allow"}
 
 
 class ModelListResponse(BaseModel):
     object: str = "list"
     data: List[ModelItem]
+    model_config = {"extra": "allow"}
