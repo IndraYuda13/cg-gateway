@@ -46,5 +46,74 @@ def test_session_continuity():
 
         print("TEST PASS: SmartSessionPool continuity with explicit_session_id and upstream session_id verified!")
 
+
+def test_update_session_id_indexes_both_original_and_final():
+    """
+    Verifies that update_session_id indexes both the original session_id (e.g. placeholder)
+    and the final upstream conversation_id, ensuring multi-turn continuity regardless
+    of which identifier the client sends in subsequent turns.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pool_file = Path(tmpdir) / "test_pool.json"
+        pool = SmartSessionPool(file_path=pool_file, max_size=5)
+
+        placeholder_sid = "placeholder-uuid-111"
+        messages = [{"role": "user", "content": "Halo, nama saya Budi."}]
+        conv_id = pool.compute_conv_id(messages=messages, explicit_session_id=placeholder_sid)
+        assert conv_id == f"custom_{placeholder_sid}"
+
+        # Turn 1: acquire fresh session
+        sid_1, p_id_1 = pool.acquire(conv_id)
+        assert p_id_1 == "client-created-root"
+
+        # Upstream returns real conversation ID
+        final_conv_id = "upstream-conv-uuid-222"
+        pool.update_session_id(conv_id, final_conv_id, orig_session_id=placeholder_sid)
+        pool.update_parent(conv_id, "msg-turn-1")
+
+        # Verify resolve_key resolves BOTH original placeholder and final upstream ID
+        assert pool.resolve_key(placeholder_sid) == conv_id
+        assert pool.resolve_key(final_conv_id) == conv_id
+        assert pool.resolve_key(f"custom_{placeholder_sid}") == conv_id
+        assert pool.resolve_key(f"custom_{final_conv_id}") == conv_id
+
+        # Verify compute_conv_id resolves to the same conversation for both IDs
+        assert pool.compute_conv_id(messages=[], explicit_session_id=placeholder_sid) == conv_id
+        assert pool.compute_conv_id(messages=[], explicit_session_id=final_conv_id) == conv_id
+
+        # Verify acquire returns the active upstream conversation ID for both
+        sid_from_placeholder, parent_from_placeholder = pool.acquire(placeholder_sid)
+        assert sid_from_placeholder == final_conv_id
+        assert parent_from_placeholder == "msg-turn-1"
+
+        sid_from_final, parent_from_final = pool.acquire(final_conv_id)
+        assert sid_from_final == final_conv_id
+        assert parent_from_final == "msg-turn-1"
+
+        # Turn 2: Upstream updates conversation ID again without explicit orig_session_id
+        next_conv_id = "upstream-conv-uuid-333"
+        pool.update_session_id(conv_id, next_conv_id)
+        pool.update_parent(conv_id, "msg-turn-2")
+
+        # All 3 identifiers must resolve to the same conversation
+        assert pool.resolve_key(placeholder_sid) == conv_id
+        assert pool.resolve_key(final_conv_id) == conv_id
+        assert pool.resolve_key(next_conv_id) == conv_id
+
+        # Verify persistence: reload pool from disk
+        reloaded_pool = SmartSessionPool(file_path=pool_file, max_size=5)
+        assert reloaded_pool.resolve_key(placeholder_sid) == conv_id
+        assert reloaded_pool.resolve_key(final_conv_id) == conv_id
+        assert reloaded_pool.resolve_key(next_conv_id) == conv_id
+        assert reloaded_pool.compute_conv_id(messages=[], explicit_session_id=placeholder_sid) == conv_id
+
+        sid_persisted, p_persisted = reloaded_pool.acquire(placeholder_sid)
+        assert sid_persisted == next_conv_id
+        assert p_persisted == "msg-turn-2"
+
+        print("TEST PASS: update_session_id indexing of both original and final session IDs verified!")
+
+
 if __name__ == "__main__":
     test_session_continuity()
+    test_update_session_id_indexes_both_original_and_final()

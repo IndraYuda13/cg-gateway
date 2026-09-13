@@ -611,6 +611,8 @@ async def sse_event_stream(
             err_str = str(ex)
             if ("404" in err_str or "not found" in err_str.lower()) and conv_id_for_upstream is not None:
                 smart_pool.reset_conv(conv_id)
+                session_id = ""
+                conv_id_for_upstream = None
                 for ev in client.stream_chat(
                     prompt=prompt,
                     model=req.model or "gpt-5-6-thinking",
@@ -721,7 +723,7 @@ async def sse_event_stream(
 
             # Update smart pool state with returned upstream conversation and message ids
             if last_conv_id:
-                smart_pool.update_session_id(conv_id, last_conv_id)
+                smart_pool.update_session_id(conv_id, last_conv_id, orig_session_id=session_id)
             if last_msg_id:
                 smart_pool.update_parent(conv_id, last_msg_id)
 
@@ -926,6 +928,7 @@ async def chat_completions(
                 err_msg = str(e)
                 if "404" in err_msg or "not found" in err_msg.lower():
                     smart_pool.reset_conv(conv_id)
+                    session_id = None
                     completion_res = await asyncio.to_thread(
                         client.chat_completion,
                         prompt=prompt_to_send,
@@ -944,7 +947,7 @@ async def chat_completions(
             final_msg_id = completion_res.get("message_id")
 
             if final_conv_id:
-                smart_pool.update_session_id(conv_id, final_conv_id)
+                smart_pool.update_session_id(conv_id, final_conv_id, orig_session_id=session_id)
             if final_msg_id:
                 smart_pool.update_parent(conv_id, final_msg_id)
 
@@ -976,7 +979,7 @@ async def chat_completions(
 
         prompt_tok_est = max(1, len(prompt_to_send) // 4)
         comp_tok_est = max(1, len(raw_content) // 4)
-        resp_session_id = req.session_id or session_id or final_conv_id
+        resp_session_id = req.session_id or final_conv_id or session_id
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -1071,6 +1074,8 @@ async def responses_sse_stream(
             err_str = str(ex)
             if ("404" in err_str or "not found" in err_str.lower()) and conv_id_for_upstream is not None:
                 smart_pool.reset_conv(conv_id)
+                session_id = ""
+                conv_id_for_upstream = None
                 for ev in client.stream_chat(
                     prompt=prompt,
                     model=req.model or "gpt-5-6-thinking",
@@ -1152,7 +1157,7 @@ async def responses_sse_stream(
                 yield format_sse(ev, data)
 
             if last_conv_id:
-                smart_pool.update_session_id(conv_id, last_conv_id)
+                smart_pool.update_session_id(conv_id, last_conv_id, orig_session_id=session_id)
             if last_msg_id:
                 smart_pool.update_parent(conv_id, last_msg_id)
 
@@ -1306,6 +1311,7 @@ async def responses_endpoint(
                 err_msg = str(e)
                 if "404" in err_msg or "not found" in err_msg.lower():
                     smart_pool.reset_conv(conv_id)
+                    session_id = None
                     completion_res = await asyncio.to_thread(
                         client.chat_completion,
                         prompt=prompt_to_send,
@@ -1392,7 +1398,7 @@ async def responses_endpoint(
             out_idx += 1
 
         if completion_res.get("conversation_id"):
-            smart_pool.update_session_id(conv_id, completion_res["conversation_id"])
+            smart_pool.update_session_id(conv_id, completion_res["conversation_id"], orig_session_id=session_id)
         if completion_res.get("message_id"):
             smart_pool.update_parent(conv_id, completion_res["message_id"])
 

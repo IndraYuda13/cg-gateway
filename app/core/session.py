@@ -16,7 +16,8 @@ class SessionEntry:
         parent_message_id: Optional[str] = "client-created-root",
         created_at: Optional[float] = None,
         last_active: Optional[float] = None,
-        turn_count: int = 1
+        turn_count: int = 1,
+        aliases: Optional[List[str]] = None
     ):
         self.session_id = session_id
         self.conv_id = conv_id
@@ -24,6 +25,7 @@ class SessionEntry:
         self.created_at = created_at or time.time()
         self.last_active = last_active or time.time()
         self.turn_count = turn_count
+        self.aliases: List[str] = list(aliases) if aliases else []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -32,7 +34,8 @@ class SessionEntry:
             "parent_message_id": self.parent_message_id,
             "created_at": self.created_at,
             "last_active": self.last_active,
-            "turn_count": self.turn_count
+            "turn_count": self.turn_count,
+            "aliases": self.aliases
         }
 
     @classmethod
@@ -43,7 +46,8 @@ class SessionEntry:
             parent_message_id=d.get("parent_message_id", "client-created-root"),
             created_at=d.get("created_at"),
             last_active=d.get("last_active"),
-            turn_count=d.get("turn_count", 1)
+            turn_count=d.get("turn_count", 1),
+            aliases=d.get("aliases", [])
         )
 
 
@@ -100,7 +104,8 @@ class SmartSessionPool:
         1. An exact key in self.pool
         2. An upstream session_id (entry.session_id)
         3. A conv_id stored in an entry
-        4. A custom_ prefixed key or stripped custom_ key
+        4. Any alias in entry.aliases (including original session_id or placeholder)
+        5. A custom_ prefixed key or stripped custom_ key
         """
         if not target_id:
             return None
@@ -122,18 +127,34 @@ class SmartSessionPool:
             if entry.conv_id and entry.conv_id == sid:
                 return k
 
-        # 4. Check with/without "custom_" prefix
+        # 4. Match entry aliases
+        for k, entry in self.pool.items():
+            if hasattr(entry, "aliases") and entry.aliases and sid in entry.aliases:
+                return k
+
+        # 5. Check with/without "custom_" prefix
         if sid.startswith("custom_"):
             stripped = sid[7:]
             if stripped in self.pool:
                 return stripped
             for k, entry in self.pool.items():
-                if (entry.session_id and entry.session_id == stripped) or (entry.conv_id and entry.conv_id == stripped):
+                if (
+                    (entry.session_id and entry.session_id == stripped)
+                    or (entry.conv_id and entry.conv_id == stripped)
+                    or (hasattr(entry, "aliases") and entry.aliases and stripped in entry.aliases)
+                ):
                     return k
         else:
             custom_key = f"custom_{sid}"
             if custom_key in self.pool:
                 return custom_key
+            for k, entry in self.pool.items():
+                if (
+                    (entry.session_id and entry.session_id == custom_key)
+                    or (entry.conv_id and entry.conv_id == custom_key)
+                    or (hasattr(entry, "aliases") and entry.aliases and custom_key in entry.aliases)
+                ):
+                    return k
 
         return None
 
@@ -241,29 +262,72 @@ class SmartSessionPool:
                     print(f"[SessionPool] Upstream delete error for {old_entry.session_id}: {e}")
 
         # Initialize fresh conversation entry
+        initial_aliases = []
+        if target_key.startswith("custom_"):
+            initial_aliases.append(target_key[7:])
+        elif conv_id and conv_id.startswith("custom_"):
+            initial_aliases.append(conv_id[7:])
+
         self.pool[target_key] = SessionEntry(
             session_id=None,
             conv_id=target_key,
             parent_message_id="client-created-root",
             created_at=now,
             last_active=now,
-            turn_count=1
+            turn_count=1,
+            aliases=initial_aliases
         )
         self.save()
         return None, "client-created-root"
 
     def update_parent(self, conv_id: str, new_parent_id: Optional[str]) -> None:
         key = self.resolve_key(conv_id) or conv_id
-        if key in self.pool and new_parent_id:
+        if new_parent_id:
+            if key not in self.pool:
+                self.pool[key] = SessionEntry(
+                    session_id=None,
+                    conv_id=key,
+                    parent_message_id=new_parent_id,
+                    turn_count=1,
+                    aliases=[]
+                )
             self.pool[key].parent_message_id = new_parent_id
             self.pool[key].last_active = time.time()
             self.save()
 
-    def update_session_id(self, conv_id: str, session_id: str) -> None:
+    def update_session_id(self, conv_id: str, session_id: str, orig_session_id: Optional[str] = None) -> None:
         key = self.resolve_key(conv_id) or conv_id
-        if key in self.pool and session_id:
-            self.pool[key].session_id = session_id
-            self.pool[key].last_active = time.time()
+        if session_id:
+            if key not in self.pool:
+                self.pool[key] = SessionEntry(
+                    session_id=session_id,
+                    conv_id=key,
+                    parent_message_id="client-created-root",
+                    turn_count=1,
+                    aliases=[]
+                )
+            entry = self.pool[key]
+            if not hasattr(entry, "aliases") or entry.aliases is None:
+                entry.aliases = []
+
+            # Index previous/original session_id and final_conv_id
+            old_sid = entry.session_id
+            if old_sid and old_sid != session_id and old_sid not in entry.aliases:
+                entry.aliases.append(old_sid)
+
+            if orig_session_id and orig_session_id != session_id and orig_session_id not in entry.aliases:
+                entry.aliases.append(orig_session_id)
+
+            if conv_id and conv_id != session_id:
+                if conv_id.startswith("custom_"):
+                    stripped = conv_id[7:]
+                    if stripped != session_id and stripped not in entry.aliases:
+                        entry.aliases.append(stripped)
+                elif conv_id not in entry.aliases:
+                    entry.aliases.append(conv_id)
+
+            entry.session_id = session_id
+            entry.last_active = time.time()
             self.save()
 
     def reset_conv(self, conv_id: str, delete_fn: Optional[Callable[[str], bool]] = None) -> None:
