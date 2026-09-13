@@ -4,11 +4,12 @@ import uuid
 import json
 import base64
 import socket
+import secrets
 import ipaddress
 import urllib.request
 import urllib.parse
 import asyncio
-from typing import Optional, Any, AsyncGenerator, Tuple, List, Dict, Union
+from typing import Optional, Any, AsyncGenerator, Tuple, List, Dict, Union, Set
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -38,7 +39,15 @@ from app.api.schemas import (
     ModelListResponse,
     ModelItem,
     ToolCall,
-    ToolCallFunction
+    ToolCallFunction,
+    ResponsesRequest
+)
+from app.core.responses_adapter import (
+    flatten_and_normalize_tools,
+    normalize_input_to_messages,
+    extract_custom_tool_input,
+    ResponsesStreamAdapter,
+    format_sse
 )
 
 router = APIRouter()
@@ -66,13 +75,22 @@ def openai_error_response(
 
 def authenticate(authorization: Optional[str] = None) -> str:
     token = DEFAULT_TOKEN
-    if isinstance(authorization, str) and authorization.startswith("Bearer "):
+    if PROXY_API_KEY:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
         bearer = authorization.split("Bearer ", 1)[1].strip()
-        if PROXY_API_KEY and bearer != PROXY_API_KEY and not bearer.startswith("eyJ"):
+        is_key_match = secrets.compare_digest(bearer, PROXY_API_KEY)
+        is_jwt = bearer.startswith("eyJ")
+        if not is_key_match and not is_jwt:
             raise HTTPException(status_code=401, detail="Invalid Proxy API Key")
         if bearer and bearer not in ("lemon", "default", "sk-123", "none", PROXY_API_KEY):
             token = bearer
+    elif isinstance(authorization, str) and authorization.startswith("Bearer "):
+        bearer = authorization.split("Bearer ", 1)[1].strip()
+        if bearer and bearer not in ("lemon", "default", "sk-123", "none"):
+            token = bearer
     return token
+
 
 
 @router.get("/health")
@@ -986,3 +1004,402 @@ async def chat_completions(
         )
     except Exception as e:
         return openai_error_response(500, f"Upstream error: {str(e)}", error_type="upstream_error")
+
+
+async def responses_sse_stream(
+    req: ResponsesRequest,
+    token: str,
+    conv_id: str,
+    session_id: str,
+    parent_msg_id: str,
+    prompt: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    history_and_training_disabled: bool = True,
+    start_delimiter: Optional[str] = None,
+    end_delimiter: Optional[str] = None,
+    freeform_tool_names: Optional[Set[str]] = None,
+    web_search: bool = False
+) -> AsyncGenerator[str, None]:
+    created = int(time.time())
+    response_id = f"resp_{uuid.uuid4().hex[:12]}"
+    client = ChatGPTUpstreamClient(token=token)
+
+    adapter = ResponsesStreamAdapter(
+        response_id=response_id,
+        created=created,
+        freeform_tool_names=freeform_tool_names
+    )
+
+    parser: Optional[LookaheadStreamParser] = None
+    if start_delimiter and end_delimiter:
+        parser = LookaheadStreamParser(start_delimiter=start_delimiter, end_delimiter=end_delimiter)
+
+    # Initial events: response.created & response.in_progress
+    for ev_name, data in adapter.emit_initial():
+        yield format_sse(ev_name, data)
+
+    last_conv_id = None
+    last_msg_id = None
+
+    conv_id_for_upstream = None
+    if parent_msg_id and parent_msg_id != "client-created-root":
+        conv_id_for_upstream = session_id
+
+    effective_thinking = req.thinking
+    effort = (req.reasoning_effort or req.thinking_effort or "").lower()
+    if effective_thinking is None and effort:
+        if effort in ("high", "extended", "medium", "max"):
+            effective_thinking = True
+        elif effort in ("none", "low", "minimal", "off"):
+            effective_thinking = False
+
+    def stream_with_retry():
+        nonlocal conv_id_for_upstream, parent_msg_id
+        try:
+            for ev in client.stream_chat(
+                prompt=prompt,
+                model=req.model or "gpt-5-6-thinking",
+                parent_message_id=parent_msg_id or "client-created-root",
+                conversation_id=conv_id_for_upstream,
+                thinking=effective_thinking,
+                attachments=attachments,
+                history_and_training_disabled=history_and_training_disabled,
+                web_search=web_search
+            ):
+                yield ev
+        except Exception as ex:
+            err_str = str(ex)
+            if ("404" in err_str or "not found" in err_str.lower()) and conv_id_for_upstream is not None:
+                smart_pool.reset_conv(conv_id)
+                for ev in client.stream_chat(
+                    prompt=prompt,
+                    model=req.model or "gpt-5-6-thinking",
+                    parent_message_id="client-created-root",
+                    conversation_id=None,
+                    thinking=effective_thinking,
+                    attachments=attachments,
+                    history_and_training_disabled=history_and_training_disabled,
+                    web_search=web_search
+                ):
+                    yield ev
+            else:
+                raise
+
+    try:
+        async with smart_pool.get_lock(conv_id):
+            for event in stream_with_retry():
+                e_type = event.get("type")
+
+                if e_type == "text":
+                    content = event.get("content", "")
+                    if content:
+                        if parser:
+                            parsed_events = parser.feed(content)
+                            for pe in parsed_events:
+                                if pe["type"] == "text" and pe["content"]:
+                                    for ev, data in adapter.handle_text_delta(pe["content"]):
+                                        yield format_sse(ev, data)
+                                elif pe["type"] == "tool_call_delta":
+                                    for tc_delta in pe["delta"].get("tool_calls", []):
+                                        for ev, data in adapter.handle_tool_call_delta(tc_delta):
+                                            yield format_sse(ev, data)
+                        else:
+                            for ev, data in adapter.handle_text_delta(content):
+                                yield format_sse(ev, data)
+
+                elif e_type == "reasoning":
+                    reasoning = event.get("reasoning", "")
+                    if reasoning:
+                        for ev, data in adapter.handle_reasoning_delta(reasoning):
+                            yield format_sse(ev, data)
+
+                elif e_type == "meta":
+                    if event.get("conversation_id"):
+                        last_conv_id = event["conversation_id"]
+                    if event.get("message_id"):
+                        last_msg_id = event["message_id"]
+
+                elif e_type == "done":
+                    if event.get("conversation_id"):
+                        last_conv_id = event["conversation_id"]
+                    if event.get("message_id"):
+                        last_msg_id = event["message_id"]
+
+                await asyncio.sleep(0)
+
+            if parser:
+                final_parsed = parser.finish()
+                for pe in final_parsed:
+                    if pe["type"] == "text" and pe["content"]:
+                        for ev, data in adapter.handle_text_delta(pe["content"]):
+                            yield format_sse(ev, data)
+                    elif pe["type"] == "tool_call_delta":
+                        for tc_delta in pe["delta"].get("tool_calls", []):
+                            for ev, data in adapter.handle_tool_call_delta(tc_delta):
+                                yield format_sse(ev, data)
+
+                for idx, completed_tc in enumerate(parser.tool_calls):
+                    for ev, data in adapter.finalize_tool_call(idx, completed_tc):
+                        yield format_sse(ev, data)
+
+            for ev, data in adapter.finalize_all_and_complete():
+                yield format_sse(ev, data)
+
+            if last_conv_id:
+                smart_pool.update_session_id(conv_id, last_conv_id)
+            if last_msg_id:
+                smart_pool.update_parent(conv_id, last_msg_id)
+
+    except Exception as e:
+        err_msg = str(e)
+        if "404" in err_msg or "not found" in err_msg.lower():
+            smart_pool.reset_conv(conv_id)
+        for ev, data in adapter.emit_failed(err_msg):
+            yield format_sse(ev, data)
+
+
+@router.post("/v1/responses")
+@router.post("/responses")
+async def responses_endpoint(
+    req: ResponsesRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    token = authenticate(authorization)
+    client = ChatGPTUpstreamClient(token=token)
+
+    # 1. Flatten tools & extract custom freeform tool names
+    normalized_tools, freeform_tool_names = flatten_and_normalize_tools(req.tools)
+
+    # 2. Normalize input items and optional instructions into MessageItem objects
+    messages, input_custom_tools = normalize_input_to_messages(
+        input_items=req.input,
+        instructions=req.instructions
+    )
+    freeform_tool_names.update(input_custom_tools)
+
+    # 3. Setup tool calling instructions if tools present
+    has_tools = bool(normalized_tools and len(normalized_tools) > 0)
+    start_delim: Optional[str] = None
+    end_delim: Optional[str] = None
+    tool_sys_prompt: str = ""
+
+    if has_tools:
+        try:
+            _, start_delim, end_delim = generate_delimiters()
+            tool_sys_prompt = compile_tool_prompt(
+                tools=normalized_tools,  # type: ignore
+                tool_choice=req.tool_choice,
+                start_delimiter=start_delim,
+                end_delimiter=end_delim,
+                parallel_tool_calls=req.parallel_tool_calls
+            )
+        except Exception as e:
+            return openai_error_response(400, f"Invalid tools definition: {e}", code="invalid_tool_schema")
+
+    # 4. Extract user prompt / tool results and any attached files or images
+    extracted_prompt, attachments = extract_prompt_and_attachments(messages, client)
+
+    if not extracted_prompt and not attachments:
+        return openai_error_response(400, "No valid user or tool message found in request")
+
+    # 5. Prepend system messages and tool prompt
+    system_parts: List[str] = []
+    for m in messages:
+        if m.role == "system":
+            c = m.content
+            if isinstance(c, str) and c.strip():
+                system_parts.append(c.strip())
+
+    combined_sys = "\n\n".join(system_parts)
+    prefix_instructions = []
+    if combined_sys:
+        prefix_instructions.append(combined_sys)
+    if tool_sys_prompt:
+        prefix_instructions.append(tool_sys_prompt)
+
+    if prefix_instructions:
+        prompt_to_send = "\n\n".join(prefix_instructions) + "\n\n" + extracted_prompt
+    else:
+        prompt_to_send = extracted_prompt
+
+    incognito_mode = req.history_and_training_disabled if req.history_and_training_disabled is not None else True
+
+    # 6. Session pool acquisition
+    messages_dicts = [m.model_dump() for m in messages]
+    conv_id = smart_pool.compute_conv_id(
+        messages=messages_dicts,
+        user=req.user,
+        explicit_session_id=req.session_id
+    )
+
+    session_id, parent_msg_id = smart_pool.acquire(
+        conv_id=conv_id,
+        create_fn=client.create_session,
+        delete_fn=client.delete_conversation,
+        force_new=bool(req.new_session)
+    )
+
+    parent_id_to_use = parent_msg_id or "client-created-root"
+
+    # 7. Streaming mode (default True for Responses API)
+    if req.stream is not False:
+        return StreamingResponse(
+            responses_sse_stream(
+                req=req,
+                token=token,
+                conv_id=conv_id,
+                session_id=session_id or "",
+                parent_msg_id=parent_id_to_use,
+                prompt=prompt_to_send,
+                attachments=attachments,
+                history_and_training_disabled=incognito_mode,
+                start_delimiter=start_delim,
+                end_delimiter=end_delim,
+                freeform_tool_names=freeform_tool_names,
+                web_search=bool(req.web_search)
+            ),
+            media_type="text/event-stream"
+        )
+
+    # 8. Non-streaming mode
+    try:
+        conv_id_for_upstream = None
+        if parent_id_to_use != "client-created-root":
+            conv_id_for_upstream = session_id
+
+        effective_thinking = req.thinking
+        effort = (req.reasoning_effort or req.thinking_effort or "").lower()
+        if effective_thinking is None and effort:
+            if effort in ("high", "extended", "medium", "max"):
+                effective_thinking = True
+            elif effort in ("none", "low", "minimal", "off"):
+                effective_thinking = False
+
+        async with smart_pool.get_lock(conv_id):
+            try:
+                completion_res = await asyncio.to_thread(
+                    client.chat_completion,
+                    prompt=prompt_to_send,
+                    model=req.model or "gpt-5-6-thinking",
+                    parent_message_id=parent_id_to_use,
+                    conversation_id=conv_id_for_upstream,
+                    thinking=effective_thinking,
+                    attachments=attachments,
+                    history_and_training_disabled=incognito_mode,
+                    web_search=bool(req.web_search)
+                )
+            except Exception as e:
+                err_msg = str(e)
+                if "404" in err_msg or "not found" in err_msg.lower():
+                    smart_pool.reset_conv(conv_id)
+                    completion_res = await asyncio.to_thread(
+                        client.chat_completion,
+                        prompt=prompt_to_send,
+                        model=req.model or "gpt-5-6-thinking",
+                        parent_message_id="client-created-root",
+                        conversation_id=None,
+                        thinking=effective_thinking,
+                        attachments=attachments,
+                        history_and_training_disabled=incognito_mode,
+                        web_search=bool(req.web_search)
+                    )
+                else:
+                    raise
+
+        raw_text = completion_res.get("text", "")
+        reasoning_content = completion_res.get("reasoning_content")
+        response_id = f"resp_{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        output_items: List[Dict[str, Any]] = []
+        out_idx = 0
+
+        if reasoning_content:
+            output_items.append({
+                "id": f"rs_{response_id}_{out_idx}",
+                "type": "reasoning",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": reasoning_content
+                    }
+                ]
+            })
+            out_idx += 1
+
+        extracted_tool_calls: List[Dict[str, Any]] = []
+        final_text = raw_text
+        if has_tools and start_delim and end_delim:
+            final_text, extracted_tool_calls = extract_tool_calls_from_text(
+                raw_text, start_delim, end_delim
+            )
+
+        if final_text:
+            output_items.append({
+                "id": f"msg_{response_id}_{out_idx}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "annotations": [],
+                        "logprobs": [],
+                        "text": final_text
+                    }
+                ]
+            })
+            out_idx += 1
+
+        for tc in extracted_tool_calls:
+            t_name = tc.get("function", {}).get("name", "")
+            t_args = tc.get("function", {}).get("arguments", "{}")
+            t_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
+
+            if t_name in freeform_tool_names:
+                custom_input = extract_custom_tool_input(t_args)
+                output_items.append({
+                    "id": f"ctc_{t_call_id}",
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": t_call_id,
+                    "name": t_name,
+                    "input": custom_input
+                })
+            else:
+                output_items.append({
+                    "id": f"fc_{t_call_id}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": t_call_id,
+                    "name": t_name,
+                    "arguments": t_args
+                })
+            out_idx += 1
+
+        if completion_res.get("conversation_id"):
+            smart_pool.update_session_id(conv_id, completion_res["conversation_id"])
+        if completion_res.get("message_id"):
+            smart_pool.update_parent(conv_id, completion_res["message_id"])
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "id": response_id,
+                "object": "response",
+                "created_at": created,
+                "status": "completed",
+                "background": False,
+                "error": None,
+                "output": output_items,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            }
+        )
+
+    except Exception as e:
+        return openai_error_response(500, str(e), error_type="server_error")
+

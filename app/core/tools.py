@@ -1,6 +1,7 @@
 import re
 import json
 import uuid
+import secrets
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 from app.api.schemas import ToolDefinition, FunctionDefinition
@@ -11,10 +12,11 @@ def generate_delimiters(nonce: Optional[str] = None) -> Tuple[str, str, str]:
     Generates a dynamic per-turn nonce and unique start/end delimiters.
     Returns: (nonce, start_delimiter, end_delimiter)
     """
-    turn_nonce = nonce or uuid.uuid4().hex[:12]
+    turn_nonce = nonce or secrets.token_hex(16)
     start_delim = f"<<<TOOL_CALL_{turn_nonce}>>>"
     end_delim = f"<<</TOOL_CALL_{turn_nonce}>>>"
     return turn_nonce, start_delim, end_delim
+
 
 
 def sanitize_user_prompt(text: str) -> str:

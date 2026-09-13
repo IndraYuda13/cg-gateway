@@ -182,3 +182,31 @@ class ModelListResponse(BaseModel):
     object: str = "list"
     data: List[ModelItem]
     model_config = {"extra": "allow"}
+
+
+class ResponsesRequest(BaseModel):
+    model: Optional[str] = "gpt-5-6-thinking"
+    input: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    tools: Optional[List[Dict[str, Any]]] = None
+    instructions: Optional[str] = None
+    stream: Optional[bool] = True
+    reasoning: Optional[Dict[str, Any]] = None
+    reasoning_effort: Optional[str] = None
+    thinking: Optional[bool] = None
+    thinking_effort: Optional[str] = None
+    temperature: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    session_id: Optional[str] = None
+    new_session: Optional[bool] = False
+    user: Optional[str] = None
+    store: Optional[bool] = None
+    include: Optional[List[str]] = None
+    client_metadata: Optional[Dict[str, Any]] = None
+    prompt_cache_key: Optional[str] = None
+    web_search: Optional[bool] = False
+    history_and_training_disabled: Optional[bool] = True
+    parallel_tool_calls: Optional[bool] = True
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    model_config = {"extra": "allow"}
+
