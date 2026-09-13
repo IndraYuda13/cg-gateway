@@ -1,0 +1,151 @@
+{
+  "task_id": "t_a6991495",
+  "mission": "CG-GATEWAY-V2 — Exhaustive Verification of Function Calling & OpenAI SDK Compatibility",
+  "timestamp": 1789292100,
+  "timestamp_iso": "2026-09-13T16:45:00+07:00",
+  "target_commit": "7b80b1322d1ba52f21859521df4c3656334a64f6",
+  "environment": {
+    "host": "Linux 6.17.0-1022-azure x86_64",
+    "python": "3.11.15",
+    "pytest": "9.1.1",
+    "openai_sdk": "2.24.0",
+    "uvicorn": "0.41.0",
+    "fastapi": "0.133.1",
+    "httpx": "0.28.1",
+    "workspace": "/root/projects/cg-gateway"
+  },
+  "verdict": "VERIFIED_PASS",
+  "summary": {
+    "total_tests_executed": 61,
+    "tests_passed": 61,
+    "tests_failed": 0,
+    "tests_skipped": 0,
+    "pass_rate_percent": 100.0,
+    "regression_status": "CLEAN",
+    "openai_sdk_contract_compliance": "VERIFIED_PASS",
+    "multi_turn_tool_cycle": "VERIFIED_PASS",
+    "adversarial_and_boundary_verification": "VERIFIED_PASS",
+    "live_systemd_endpoint_health": "VERIFIED_PASS"
+  },
+  "acceptance_criteria_results": {
+    "1_regression_verification": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Executed `pytest tests/ -v`. All 61 test cases across 10 test modules passed with zero failures in 54.40s. All existing capabilities (multi-turn session pool, vision/multimodal uploads, SSE parser, CLI client) preserved without regression.",
+      "test_count": 61,
+      "failed_count": 0
+    },
+    "2_openai_sdk_contract_compliance": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Tested with official `openai` Python SDK (v2.24.0). Non-streaming completions return valid `openai.types.chat.ChatCompletion` with `choices[0].message.tool_calls` containing typed `ChatCompletionMessageToolCall` (id, type='function', function.name, function.arguments). Streaming completions return `ChatCompletionChunk` streams with `delta.tool_calls` properly populated by index and successfully accumulated into complete tool call structures by standard SDK consumers.",
+      "verified_modes": ["non-streaming", "streaming", "parallel_tool_calls"]
+    },
+    "3_multi_turn_tool_cycle": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Turn 1 (user message -> assistant tool_calls) and Turn 2 (client submits role='tool' result with tool_call_id) tested end-to-end through OpenAI SDK. The gateway translates role='tool' messages into upstream prompt context with tool name resolution fallback and preserves session_id and parent_message_id continuity in SmartSessionPool.",
+      "verified_flow": "User Prompt -> Tool Call ID -> Tool Result Injection -> Final Assistant Response"
+    },
+    "4_adversarial_and_boundary_verification": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Verified clean HTTP 400 responses with OpenAI-compatible error payloads for invalid tool schemas (caught as `openai.BadRequestError`). Verified LookaheadStreamParser bounded buffer protection preventing ReDoS/OOM on payloads > 64KB (tool buffer) and > 1MB (turn buffer). Verified user prompt delimiter escaping against prompt injection. Verified MCP security sandbox: SSRF protection blocking localhost/private/metadata IP addresses, command execution blocking shell metacharacters, and environment sanitization stripping LD_PRELOAD/BASH_ENV.",
+      "security_checks": ["SSRF_BLOCK", "CMD_SANDBOX", "ENV_SANITIZATION", "DELIMITER_ESCAPING", "BUFFER_OVERFLOW_GUARDS"]
+    }
+  },
+  "detailed_test_matrix": [
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_non_streaming_tool_call",
+      "result": "PASSED",
+      "focus": "OpenAI Python SDK ChatCompletion non-streaming contract & Pydantic serialization"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_streaming_tool_call_accumulation",
+      "result": "PASSED",
+      "focus": "OpenAI Python SDK ChatCompletionChunk streaming & delta.tool_calls accumulation"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_parallel_tool_calling_non_streaming",
+      "result": "PASSED",
+      "focus": "Parallel tool calls non-streaming (multiple functions in single turn)"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_parallel_tool_calling_streaming",
+      "result": "PASSED",
+      "focus": "Parallel tool calls streaming (incremental delta indices index=0, index=1)"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_multi_turn_cycle",
+      "result": "PASSED",
+      "focus": "Full Turn 1 -> Tool Execution -> Turn 2 cycle with SmartSessionPool continuity"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_invalid_tool_schema_returns_clean_400_bad_request",
+      "result": "PASSED",
+      "focus": "Malformed tool schema returns HTTP 400 with invalid_tool_schema error code (OpenAI SDK BadRequestError)"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_empty_messages_returns_clean_400",
+      "result": "PASSED",
+      "focus": "Empty messages list rejected cleanly with HTTP 400"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_prompt_injection_delimiter_escaping",
+      "result": "PASSED",
+      "focus": "Delimiter escaping against prompt injection and lookalike delimiters"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_malformed_json_cleaning_and_resilience",
+      "result": "PASSED",
+      "focus": "Resilience against malformed JSON (trailing commas, quotes) in tool call parser"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_stream_parser_buffer_limit_protection",
+      "result": "PASSED",
+      "focus": "Bounded buffer protection against ReDoS / OOM on oversized streams"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_mcp_bridge_ssrf_protection_matrix",
+      "result": "PASSED",
+      "focus": "SSRF protection blocking loopback, private ranges, AWS/Azure/GCP metadata endpoints"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_mcp_bridge_command_sandbox",
+      "result": "PASSED",
+      "focus": "Local MCP command injection prevention blocking shell metacharacters (; | & $ ` > <)"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_mcp_bridge_environment_sanitization",
+      "result": "PASSED",
+      "focus": "Environment variable sanitization stripping LD_PRELOAD, DYLD_INSERT_LIBRARIES, BASH_ENV"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_tool_choice_options",
+      "result": "PASSED",
+      "focus": "tool_choice support ('none', 'auto', 'required', named object)"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_streaming_with_reasoning_and_tools",
+      "result": "PASSED",
+      "focus": "Simultaneous reasoning stream (delta.reasoning_content) alongside delta.tool_calls"
+    },
+    {
+      "suite": "tests/test_prism_verification.py",
+      "test": "test_openai_sdk_live_systemd_endpoint_smoke",
+      "result": "PASSED",
+      "focus": "Live systemd service smoke check on 127.0.0.1:8560 via OpenAI SDK"
+    }
+  ]
+}
