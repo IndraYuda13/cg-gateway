@@ -1,0 +1,61 @@
+{
+  "task_id": "t_91624581",
+  "mission": "[CG-GATEWAY-V2.1] ATLAS: Reload Gateway, Configure Codex CLI & Execute Live E2E Tool Call",
+  "timestamp": 1789299400,
+  "timestamp_iso": "2026-09-13T18:32:00+07:00",
+  "deployed_commit": "24dfd58a12c319ea7a1e33a9e968e3f63dde99bf",
+  "service_status": {
+    "systemd_unit": "cg-gateway.service",
+    "state": "active (running)",
+    "pid": 798575,
+    "port": 8560,
+    "health_endpoint": "http://127.0.0.1:8560/health",
+    "health_response_status": "online"
+  },
+  "codex_configuration": {
+    "config_file": "/root/.codex/config.toml",
+    "model": "gpt-5.6-sol",
+    "model_provider": "cg",
+    "base_url": "http://127.0.0.1:8560/v1",
+    "wire_api": "responses"
+  },
+  "e2e_verification_evidence": {
+    "smoke_test_1_file_creation": {
+      "status": "VERIFIED_PASS",
+      "target_file": "/tmp/codex_live_test.txt",
+      "expected_content": "CODEX_E2E_VERIFICATION_SUCCESS_BY_ATLAS_2026",
+      "actual_content": "CODEX_E2E_VERIFICATION_SUCCESS_BY_ATLAS_2026",
+      "codex_tool_executed": "exec",
+      "command": "/bin/bash -lc \"printf 'CODEX_E2E_VERIFICATION_SUCCESS_BY_ATLAS_2026' > /tmp/codex_live_test.txt\" in /root/projects/cg-gateway",
+      "disk_verification_cmd": "test -f /tmp/codex_live_test.txt && cat /tmp/codex_live_test.txt"
+    },
+    "smoke_test_2_system_inspection": {
+      "status": "VERIFIED_PASS",
+      "target_commands": ["hostname", "uname -r"],
+      "codex_tool_executed": "exec",
+      "command": "/bin/bash -lc 'hostname && uname -r' in /root/projects/cg-gateway",
+      "raw_execution_output": "Rawon\n6.17.0-1022-azure\n",
+      "reported_hostname": "Rawon",
+      "reported_kernel": "6.17.0-1022-azure"
+    }
+  },
+  "remediated_defects": [
+    {
+      "defect_id": "DEFECT-ATLAS-RESP-01",
+      "severity": "CRITICAL",
+      "component": "app/api/routes.py (responses_endpoint)",
+      "description": "Codex CLI v0.154.0 sends client tools inside req.input under type: 'additional_tools', keeping req.tools: None. Gateway previously only checked req.tools, causing tools_len=0 and disabling tool compilation.",
+      "remediation": "Extracted tool definitions from req.input where type == 'additional_tools' and concatenated them into raw_tools before flatten_and_normalize_tools.",
+      "fix_commit": "78dac261f5b798a49e59aabdef00d4b4243b795e"
+    },
+    {
+      "defect_id": "DEFECT-ATLAS-RESP-02",
+      "severity": "HIGH",
+      "component": "app/core/stream_parser.py & app/core/responses_adapter.py",
+      "description": "Tool calls were only finalized at stream completion, leaving tool call output items active in ResponsesStreamAdapter while subsequent model text arrived, triggering 'OutputTextDelta without active item' in Codex CLI.",
+      "remediation": "Emitted 'tool_call_completed' immediately when the end delimiter matches in LookaheadStreamParser. ResponsesStreamAdapter auto-finalizes any active tool before starting text deltas.",
+      "fix_commit": "24dfd58a12c319ea7a1e33a9e968e3f63dde99bf"
+    }
+  ],
+  "verdict": "VERIFIED_PASS"
+}
