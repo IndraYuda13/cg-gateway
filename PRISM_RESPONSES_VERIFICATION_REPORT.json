@@ -1,0 +1,235 @@
+{
+  "task_id": "t_b946d195",
+  "mission": "CG-GATEWAY-V2.1 — Independent Verification of /v1/responses Wire Protocol & Codex CLI Tool Calls",
+  "timestamp": 1789297200,
+  "timestamp_iso": "2026-09-13T17:55:00+07:00",
+  "target_commit": "d0bc0d6584d1695c4dd4c25c74a7b8121d0669c0",
+  "upstream_parent_commit": "348bff3ff32aa9dd9fe7b5967863d5bac296b211",
+  "environment": {
+    "host": "Linux 6.17.0-1022-azure x86_64",
+    "python": "3.11.15",
+    "pytest": "9.1.1",
+    "uvicorn": "0.41.0",
+    "fastapi": "0.133.1",
+    "codex_wire_target": "OpenAI Codex CLI v0.154.0 wire protocol",
+    "project_dir": "/root/projects/cg-gateway",
+    "workspace": "/root/.hermes/kanban/workspaces/t_b946d195"
+  },
+  "verdict": "VERIFIED_PASS",
+  "summary": {
+    "total_tests_in_repo": 98,
+    "total_tests_passed": 98,
+    "total_tests_failed": 0,
+    "pass_rate_percent": 100.0,
+    "prism_verification_tests_count": 22,
+    "forge_responses_tests_count": 15,
+    "regression_status": "CLEAN",
+    "tool_flattening_compliance": "VERIFIED_PASS",
+    "custom_tool_streaming": "VERIFIED_PASS",
+    "function_call_streaming": "VERIFIED_PASS",
+    "multi_turn_continuation": "VERIFIED_PASS",
+    "delimiter_sanitization": "VERIFIED_PASS",
+    "security_and_auth": "VERIFIED_PASS"
+  },
+  "remediated_defects": [
+    {
+      "defect_id": "DEFECT-PRISM-RESP-01",
+      "severity": "HIGH",
+      "component": "app.core.responses_adapter.extract_custom_tool_input",
+      "detected_by": "PRISM independent verification (test_prism_custom_tool_token_streaming_fine_grained)",
+      "description": "During chunk-by-chunk streaming of custom tool arguments (e.g. {\"input\": \"...\"), extract_custom_tool_input fell through to 'return s' when partial JSON prefix syntax had not yet matched the regex. This caused ResponsesStreamAdapter to emit JSON syntax characters ({\"input\": \") as custom tool input deltas, and subsequently stalled real input value streaming until the input length exceeded 11 characters.",
+      "remediation_action": "Routed via native A2A to owning implementer FORGE. Added incomplete JSON prefix guard: if s.startswith('{') or s.startswith('['): return ''. FORGE added regression test test_stream_adapter_custom_tool_fine_grained_json_chunks and committed fix.",
+      "fix_commit": "d0bc0d6584d1695c4dd4c25c74a7b8121d0669c0",
+      "reverification_status": "VERIFIED_PASS"
+    }
+  ],
+  "acceptance_criteria_results": {
+    "1_tool_flattening_and_namespace_normalization": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Tested deep and mixed namespace structures (functions, admin_tools, empty namespaces, and hosted tools). Verified that custom tools (exec, apply_patch) are synthesized into OpenAI function definitions with parameters: type=object, properties={input: {type: 'string'}}, required=['input'], additionalProperties=False. Verified that hosted server-side tools (web_search, image_generation) are purged completely. Freeform tool names set accurately captures custom tools without leaking standard functions.",
+      "tests": [
+        "test_prism_namespace_tool_flattening_deep_and_mixed",
+        "test_prism_custom_tool_parameter_schema_strictness",
+        "test_prism_custom_tool_description_composition",
+        "test_prism_hosted_tools_purging"
+      ]
+    },
+    "2_custom_freeform_tool_delta_streaming": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Verified exact OpenAI Codex wire event sequence: response.created -> response.in_progress -> response.output_item.added (type: custom_tool_call) -> response.custom_tool_call_input.delta -> response.custom_tool_call_input.done -> response.output_item.done -> response.completed. Verified fine-grained token-by-token streaming, complex multiline bash scripts with heredocs and quotes, and unified diff patches.",
+      "tests": [
+        "test_prism_extract_custom_tool_input_boundaries",
+        "test_prism_custom_tool_token_streaming_fine_grained",
+        "test_prism_custom_tool_multiline_bash_and_heredoc",
+        "test_prism_custom_tool_patch_diff_format",
+        "test_prism_wire_codex_cli_custom_tool_e2e"
+      ]
+    },
+    "3_standard_function_call_delta_streaming": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Verified standard function call argument streaming using response.function_call_arguments.delta and response.function_call_arguments.done. Verified parallel tool call streaming with mixed custom and function tools in a single turn, asserting independent index tracking, distinct output_index positions, and complete response.output consolidation.",
+      "tests": [
+        "test_prism_standard_function_call_streaming",
+        "test_prism_parallel_tool_calls_streaming_ordering",
+        "test_prism_stream_adapter_sequence_number_monotonicity"
+      ]
+    },
+    "4_multi_turn_continuation": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Verified end-to-end multi-turn continuation with function_call_output and custom_tool_call_output. normalize_input_to_messages correctly maps tool outputs to MessageItem(role='tool', tool_call_id=..., content=...). Upstream prompt compiler compiles [Tool Result for <name> (<call_id>)]\\n<output> into session context, maintaining session continuity across multiple turns.",
+      "tests": [
+        "test_prism_normalize_input_all_item_types",
+        "test_prism_normalize_adjacent_tool_calls_coalescing",
+        "test_prism_wire_multi_turn_continuation_flow"
+      ]
+    },
+    "5_delimiter_sanitization_and_turn_nonce": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Adversarial matrix tested across user messages, system instructions, developer messages, and tool outputs with malicious lookalike delimiters (case variations, spacing variations, nested lookalikes). Sanitization successfully neutralizes unescaped delimiters to \\<\\<\\<... patterns. Cryptographic turn nonce generator verified with 16 bytes (32 hex chars) entropy and zero collisions across 100 consecutive generations.",
+      "tests": [
+        "test_prism_delimiter_injection_adversarial_matrix",
+        "test_prism_dynamic_nonce_cryptographic_randomness"
+      ]
+    },
+    "6_zero_regression_across_existing_suites": {
+      "status": "VERIFIED_PASS",
+      "evidence": "Ran full test suite pytest across all 10 test modules (tests/test_api_multi_turn.py, tests/test_cli_client.py, tests/test_function_calling.py, tests/test_multi_files.py, tests/test_prism_responses.py, tests/test_prism_verification.py, tests/test_responses_api.py, tests/test_session_pool.py, tests/test_sse_parsing.py, tests/test_vision.py). All 98 tests passed with zero failures in 70.71s.",
+      "total_tests": 98,
+      "failed_tests": 0
+    }
+  },
+  "detailed_test_matrix": [
+    {
+      "test": "test_prism_namespace_tool_flattening_deep_and_mixed",
+      "domain": "Tool Flattening & Namespace Normalization",
+      "focus": "Deep/mixed namespaces, multiple namespaces, empty tools lists, hosted tool purging",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_custom_tool_parameter_schema_strictness",
+      "domain": "Tool Flattening & Namespace Normalization",
+      "focus": "Strict parameters schema synthesis: input: string, required=['input'], additionalProperties=False",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_custom_tool_description_composition",
+      "domain": "Tool Flattening & Namespace Normalization",
+      "focus": "Composition of description, syntax, and definition with fallback",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_hosted_tools_purging",
+      "domain": "Tool Flattening & Namespace Normalization",
+      "focus": "Purging web_search and image_generation from top-level and inner namespaces",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_normalize_input_all_item_types",
+      "domain": "Input Normalization & Message Transformation",
+      "focus": "Developer, system, user (multimodal text/image/file), assistant, and tool outputs mapping",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_normalize_adjacent_tool_calls_coalescing",
+      "domain": "Input Normalization & Message Transformation",
+      "focus": "Coalescing consecutive tool call items into single assistant message with tool_calls array",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_delimiter_injection_adversarial_matrix",
+      "domain": "Security & Delimiter Sanitization",
+      "focus": "Adversarial lookalike delimiter injection escaping across all message roles and tool outputs",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_dynamic_nonce_cryptographic_randomness",
+      "domain": "Security & Delimiter Sanitization",
+      "focus": "Cryptographic turn nonce entropy (>=32 hex chars) and zero collisions across 100 rounds",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_extract_custom_tool_input_boundaries",
+      "domain": "Custom Tool Streaming & Parsing",
+      "focus": "Edge cases: empty strings, dicts, multiline strings, escaped quotes, partial JSON prefixes",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_custom_tool_token_streaming_fine_grained",
+      "domain": "Custom Tool Streaming & Parsing",
+      "focus": "Character-by-character streaming of custom tool arguments without prefix corruption",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_custom_tool_multiline_bash_and_heredoc",
+      "domain": "Custom Tool Streaming & Parsing",
+      "focus": "Multiline shell scripts containing heredocs, subshells, quotes, and variables",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_custom_tool_patch_diff_format",
+      "domain": "Custom Tool Streaming & Parsing",
+      "focus": "Unified diff patch streaming for apply_patch custom tool",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_standard_function_call_streaming",
+      "domain": "Standard Function Call Streaming",
+      "focus": "Standard function_call_arguments.delta and function_call_arguments.done streaming",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_parallel_tool_calls_streaming_ordering",
+      "domain": "Standard Function Call Streaming",
+      "focus": "Parallel mixed custom + function tool calls in single turn with separate indices",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_stream_adapter_sequence_number_monotonicity",
+      "domain": "Wire Protocol & Event Ordering",
+      "focus": "Strict monotonic incrementation of sequence_number across all emitted SSE events",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_sse_framing_and_event_sequence",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "Live HTTP SSE framing 'event: ...\\ndata: ...\\n\\n' and response object schemas",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_codex_cli_custom_tool_e2e",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "End-to-end OpenAI Codex CLI v0.154.0 custom tool execution wire simulation",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_multi_turn_continuation_flow",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "Multi-turn tool result injection and upstream prompt forwarding verification",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_reasoning_stream_and_effort_parameter",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "Reasoning summary stream interleaving and reasoning_effort='high' to thinking=True mapping",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_route_aliases_parity",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "Parity between POST /v1/responses and POST /responses route aliases",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_auth_fail_closed_validation",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "Fail-closed authentication (HTTP 401 on missing or invalid Bearer token)",
+      "result": "PASSED"
+    },
+    {
+      "test": "test_prism_wire_validation_errors_and_stream_failure",
+      "domain": "Live HTTP Wire Verification",
+      "focus": "HTTP 400 on empty input and response.failed SSE emission on unexpected upstream error",
+      "result": "PASSED"
+    }
+  ]
+}
