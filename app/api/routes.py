@@ -1103,6 +1103,9 @@ async def responses_sse_stream(
                                     for tc_delta in pe["delta"].get("tool_calls", []):
                                         for ev, data in adapter.handle_tool_call_delta(tc_delta):
                                             yield format_sse(ev, data)
+                                elif pe["type"] == "tool_call_completed":
+                                    for ev, data in adapter.finalize_tool_call(pe["index"], pe["tool_call"]):
+                                        yield format_sse(ev, data)
                         else:
                             for ev, data in adapter.handle_text_delta(content):
                                 yield format_sse(ev, data)
@@ -1137,6 +1140,9 @@ async def responses_sse_stream(
                         for tc_delta in pe["delta"].get("tool_calls", []):
                             for ev, data in adapter.handle_tool_call_delta(tc_delta):
                                 yield format_sse(ev, data)
+                    elif pe["type"] == "tool_call_completed":
+                        for ev, data in adapter.finalize_tool_call(pe["index"], pe["tool_call"]):
+                            yield format_sse(ev, data)
 
                 for idx, completed_tc in enumerate(parser.tool_calls):
                     for ev, data in adapter.finalize_tool_call(idx, completed_tc):

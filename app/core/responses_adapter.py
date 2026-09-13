@@ -495,8 +495,15 @@ class ResponsesStreamAdapter:
         events.extend(self.emit_initial())
         events.extend(self.finalize_reasoning())
 
-        if not self.msg_active and not self.msg_done:
+        # If there are open tool calls, finalize them before emitting text
+        for idx in sorted(self.tools.keys()):
+            if not self.tools[idx]["done"]:
+                events.extend(self.finalize_tool_call(idx))
+
+        if not self.msg_active:
             self.msg_active = True
+            self.msg_done = False
+            self.msg_text_buf = ""
             self.msg_index = self.current_output_index
             self.current_output_index += 1
             self.msg_id = f"msg_{self.response_id}_{self.msg_index}"

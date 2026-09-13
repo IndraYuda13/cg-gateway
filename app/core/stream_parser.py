@@ -410,15 +410,23 @@ class LookaheadStreamParser:
             self.streamed_arg_pos = len(final_args_str)
 
         # Record completed tool call
-        self.tool_calls.append({
+        completed_tc = {
             "id": self.current_tool_id,
             "type": "function",
             "function": {
                 "name": tool_name,
                 "arguments": final_args_str
             }
-        })
+        }
+        self.tool_calls.append(completed_tc)
 
+        tc_idx = self.current_tool_index
         # Advance to next tool call index
         self.current_tool_index += 1
+
+        events.append({
+            "type": "tool_call_completed",
+            "index": tc_idx,
+            "tool_call": completed_tc
+        })
         return events
