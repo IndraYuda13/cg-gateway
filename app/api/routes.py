@@ -26,7 +26,8 @@ from app.core.tools import (
     sanitize_user_prompt,
     compile_tool_prompt,
     extract_tool_calls_from_text,
-    format_tool_definitions
+    format_tool_definitions,
+    CODEX_BACKEND_EXECUTION_PROMPT
 )
 from app.core.stream_parser import LookaheadStreamParser
 from app.core.mcp_bridge import mcp_bridge, MCPSecurityError
@@ -1210,7 +1211,8 @@ async def responses_endpoint(
                 tool_choice=req.tool_choice,
                 start_delimiter=start_delim,
                 end_delimiter=end_delim,
-                parallel_tool_calls=req.parallel_tool_calls
+                parallel_tool_calls=req.parallel_tool_calls,
+                backend_contract=CODEX_BACKEND_EXECUTION_PROMPT
             )
         except Exception as e:
             return openai_error_response(400, f"Invalid tools definition: {e}", code="invalid_tool_schema")

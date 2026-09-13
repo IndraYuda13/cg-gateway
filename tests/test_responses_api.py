@@ -785,3 +785,65 @@ def test_endpoint_responses_additional_tools_in_input(responses_server_url):
         prompt_sent = mock_stream.call_args[1]["prompt"]
         assert "# TOOL CALLING INSTRUCTIONS" in prompt_sent
         assert "exec" in prompt_sent
+        assert "You are acting as the execution backend for OpenAI Codex" in prompt_sent
+        assert "NEVER say that you lack access to the machine or terminal." in prompt_sent
+        assert "IMMEDIATELY call the appropriate tool" in prompt_sent
+
+
+def test_responses_codex_backend_execution_prompt_injected(responses_server_url):
+    """
+    Verifies that when tools are provided in /v1/responses,
+    the Codex backend execution contract is prepended to the system prompt sent to upstream.
+    """
+    url = f"{responses_server_url}/v1/responses"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer lemon"
+    }
+    payload = {
+        "model": "gpt-5-6-thinking",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec",
+                "description": "Run shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }
+        ],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "cek kondisi vps gw"
+            }
+        ],
+        "stream": True
+    }
+
+    mock_nonce = "test_nonce_backend_contract"
+    start_delim = f"<<<TOOL_CALL_{mock_nonce}>>>"
+    end_delim = f"<<</TOOL_CALL_{mock_nonce}>>>"
+    mock_chunks = [
+        {"type": "text", "content": "Checking VPS..."},
+        {"type": "done", "conversation_id": "conv_contract_1", "message_id": "msg_contract_1"}
+    ]
+
+    with patch("app.api.routes.generate_delimiters", return_value=(mock_nonce, start_delim, end_delim)), \
+         patch.object(ChatGPTUpstreamClient, "stream_chat", return_value=iter(mock_chunks)) as mock_stream:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+            resp.read()
+
+        prompt_sent = mock_stream.call_args[1]["prompt"]
+        assert "You are acting as the execution backend for OpenAI Codex" in prompt_sent
+        assert "You HAVE direct access to the local environment and terminal via your attached tools" in prompt_sent
+        assert "1. NEVER say that you lack access to the machine or terminal." in prompt_sent
+        assert "2. NEVER ask the user to run commands manually when you have the tools to run them yourself." in prompt_sent
+        assert "3. IMMEDIATELY call the appropriate tool (e.g. `exec`)" in prompt_sent
+        assert "# TOOL CALLING INSTRUCTIONS" in prompt_sent
+        assert "exec" in prompt_sent

@@ -2,6 +2,7 @@ import json
 import uuid
 import pytest
 import asyncio
+from typing import Any, List, Dict, Optional
 from unittest.mock import MagicMock, patch
 from fastapi.responses import JSONResponse
 
@@ -27,7 +28,8 @@ from app.core.tools import (
     compile_tool_prompt,
     parse_tool_call_json,
     extract_tool_calls_from_text,
-    clean_malformed_json
+    clean_malformed_json,
+    CODEX_BACKEND_EXECUTION_PROMPT
 )
 from app.core.stream_parser import LookaheadStreamParser, ParserState
 from app.core.session import SmartSessionPool
@@ -192,6 +194,33 @@ def test_compile_tool_prompt_tool_choices():
         end_delimiter=end_delim
     )
     assert "You MUST call the tool 'calc'" in prompt_spec
+
+
+def test_compile_tool_prompt_backend_contract():
+    tools: list[Any] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }
+        }
+    ]
+    nonce, start_delim, end_delim = generate_delimiters("fixed_nonce_backend")
+    prompt = compile_tool_prompt(
+        tools=tools,
+        tool_choice="auto",
+        start_delimiter=start_delim,
+        end_delimiter=end_delim,
+        backend_contract=CODEX_BACKEND_EXECUTION_PROMPT
+    )
+    assert "You are acting as the execution backend for OpenAI Codex" in prompt
+    assert "NEVER say that you lack access to the machine or terminal." in prompt
+    assert "IMMEDIATELY call the appropriate tool" in prompt
+    assert start_delim in prompt
+    assert end_delim in prompt
+    assert "exec" in prompt
 
 
 def test_parse_tool_call_json_formats():

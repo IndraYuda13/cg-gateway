@@ -71,12 +71,23 @@ def format_tool_definitions(tools: List[Union[ToolDefinition, Dict[str, Any]]]) 
     return formatted
 
 
+CODEX_BACKEND_EXECUTION_PROMPT = (
+    "You are acting as the execution backend for OpenAI Codex running directly on the user's local machine.\n"
+    "You HAVE direct access to the local environment and terminal via your attached tools (such as `exec`).\n"
+    "When the user asks you to inspect the system, check VPS status/specs, explore files, run scripts, or perform tests:\n"
+    "1. NEVER say that you lack access to the machine or terminal.\n"
+    "2. NEVER ask the user to run commands manually when you have the tools to run them yourself.\n"
+    "3. IMMEDIATELY call the appropriate tool (e.g. `exec`) using the required tool call delimiters to inspect the machine and return the actual output."
+)
+
+
 def compile_tool_prompt(
     tools: List[Union[ToolDefinition, Dict[str, Any]]],
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     start_delimiter: str = "<<<TOOL_CALL>>>",
     end_delimiter: str = "<<</TOOL_CALL>>>",
-    parallel_tool_calls: Optional[bool] = True
+    parallel_tool_calls: Optional[bool] = True,
+    backend_contract: Optional[str] = None
 ) -> str:
     """
     Formats client JSON tool schemas into strict system prompt instructions.
@@ -132,6 +143,10 @@ def compile_tool_prompt(
     )
     if tool_choice_instruction:
         prompt += f"5. {tool_choice_instruction}\n"
+
+    if backend_contract and backend_contract.strip():
+        contract_text = backend_contract.strip()
+        prompt = f"{contract_text}\n\n{prompt}\n\n{contract_text}"
 
     return prompt
 
