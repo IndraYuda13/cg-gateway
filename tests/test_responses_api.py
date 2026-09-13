@@ -292,6 +292,37 @@ def test_fail_closed_auth_with_secrets_compare_digest():
         assert exc_info.value.status_code == 401
 
 
+def test_authenticate_token_override_rules():
+    from app.config import DEFAULT_TOKEN
+    from fastapi import HTTPException
+
+    # 1. When PROXY_API_KEY is not configured:
+    with patch("app.api.routes.PROXY_API_KEY", ""):
+        # sk-* keys keep DEFAULT_TOKEN (preventing upstream 401 on ChatGPT Web)
+        assert authenticate("Bearer sk-somekey") == DEFAULT_TOKEN
+        assert authenticate("Bearer sk-proj-1234567890abcdef") == DEFAULT_TOKEN
+        assert authenticate("Bearer lemon") == DEFAULT_TOKEN
+        assert authenticate(None) == DEFAULT_TOKEN
+
+        # Only eyJ... JWT tokens override token
+        jwt_token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.dummy_payload"
+        assert authenticate(f"Bearer {jwt_token}") == jwt_token
+
+    # 2. When PROXY_API_KEY is configured:
+    with patch("app.api.routes.PROXY_API_KEY", "sk-configured-proxy-key"):
+        # Configured proxy key validates access but preserves DEFAULT_TOKEN
+        assert authenticate("Bearer sk-configured-proxy-key") == DEFAULT_TOKEN
+
+        # eyJ... JWT token validates proxy access and overrides token
+        jwt_token_2 = "eyJhbGciOiJSUzI1NiJ9.upstream_access_token"
+        assert authenticate(f"Bearer {jwt_token_2}") == jwt_token_2
+
+        # Invalid/unmatched key fails closed with 401
+        with pytest.raises(HTTPException) as exc_info:
+            authenticate("Bearer sk-unauthorized")
+        assert exc_info.value.status_code == 401
+
+
 # ============================================================================
 # 4. SSE Stream Adapter & Event Sequence Tests
 # ============================================================================
@@ -693,3 +724,64 @@ def test_endpoint_responses_validation_errors(responses_server_url):
     with pytest.raises(urllib.error.HTTPError) as exc_info:
         urllib.request.urlopen(req)
     assert exc_info.value.code == 400
+
+
+def test_endpoint_responses_additional_tools_in_input(responses_server_url):
+    """
+    Verifies that OpenAI Codex CLI v0.154.0 additional_tools sent inside req.input
+    are correctly discovered, flattened, and compiled into tool prompt when req.tools is None.
+    """
+    url = f"{responses_server_url}/v1/responses"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer lemon"
+    }
+    payload = {
+        "model": "gpt-5-6-thinking",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "tools": [
+                            {
+                                "type": "custom",
+                                "name": "exec",
+                                "description": "Run shell commands"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Run hostname"
+            }
+        ],
+        "stream": True
+    }
+
+    mock_nonce = "test_nonce_add_tools"
+    start_delim = f"<<<TOOL_CALL_{mock_nonce}>>>"
+    end_delim = f"<<</TOOL_CALL_{mock_nonce}>>>"
+    mock_chunks = [
+        {"type": "text", "content": f"{start_delim}\n"},
+        {"type": "text", "content": '{"name": "exec", "arguments": {"input": "hostname"}}\n'},
+        {"type": "text", "content": f"{end_delim}"},
+        {"type": "done", "conversation_id": "conv_add_1", "message_id": "msg_add_1"}
+    ]
+
+    with patch("app.api.routes.generate_delimiters", return_value=(mock_nonce, start_delim, end_delim)), \
+         patch.object(ChatGPTUpstreamClient, "stream_chat", return_value=iter(mock_chunks)) as mock_stream:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+            raw_body = resp.read().decode("utf-8")
+
+        prompt_sent = mock_stream.call_args[1]["prompt"]
+        assert "# TOOL CALLING INSTRUCTIONS" in prompt_sent
+        assert "exec" in prompt_sent

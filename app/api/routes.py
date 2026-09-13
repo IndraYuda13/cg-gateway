@@ -1167,8 +1167,16 @@ async def responses_endpoint(
     token = authenticate(authorization)
     client = ChatGPTUpstreamClient(token=token)
 
-    # 1. Flatten tools & extract custom freeform tool names
-    normalized_tools, freeform_tool_names = flatten_and_normalize_tools(req.tools)
+    # 1. Flatten tools & extract custom freeform tool names (including additional_tools in req.input)
+    raw_tools = list(req.tools or [])
+    if req.input:
+        for item in req.input:
+            if isinstance(item, dict) and item.get("type") == "additional_tools":
+                in_tools = item.get("tools")
+                if isinstance(in_tools, list):
+                    raw_tools.extend(in_tools)
+
+    normalized_tools, freeform_tool_names = flatten_and_normalize_tools(raw_tools)
 
     # 2. Normalize input items and optional instructions into MessageItem objects
     messages, input_custom_tools = normalize_input_to_messages(
