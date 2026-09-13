@@ -83,11 +83,11 @@ def authenticate(authorization: Optional[str] = None) -> str:
         is_jwt = bearer.startswith("eyJ")
         if not is_key_match and not is_jwt:
             raise HTTPException(status_code=401, detail="Invalid Proxy API Key")
-        if bearer and bearer not in ("lemon", "default", "sk-123", "none", PROXY_API_KEY):
+        if is_jwt:
             token = bearer
     elif isinstance(authorization, str) and authorization.startswith("Bearer "):
         bearer = authorization.split("Bearer ", 1)[1].strip()
-        if bearer and bearer not in ("lemon", "default", "sk-123", "none"):
+        if bearer.startswith("eyJ"):
             token = bearer
     return token
 
