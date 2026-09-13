@@ -404,6 +404,34 @@ def test_stream_adapter_custom_tool_call_delta_streaming():
     assert output[0]["input"] == "cat README.md"
 
 
+def test_stream_adapter_custom_tool_fine_grained_json_chunks():
+    adapter = ResponsesStreamAdapter(
+        response_id="resp_unit_fine",
+        created=1780000000,
+        freeform_tool_names={"exec"}
+    )
+    events = []
+    events.extend(adapter.handle_tool_call_delta({
+        "index": 0,
+        "id": "call_exec_fine",
+        "function": {"name": "exec", "arguments": ""}
+    }))
+    chunks = ['{"', 'in', 'pu', 't"', ': ', '"', 'e', 'ch', 'o ', 'ok', '"', '}']
+    for c in chunks:
+        events.extend(adapter.handle_tool_call_delta({
+            "index": 0,
+            "function": {"arguments": c}
+        }))
+    events.extend(adapter.finalize_tool_call(0, {
+        "id": "call_exec_fine",
+        "function": {"name": "exec", "arguments": '{"input": "echo ok"}'}
+    }))
+    events.extend(adapter.finalize_all_and_complete())
+
+    deltas = [ev[1]["delta"] for ev in events if ev[0] == "response.custom_tool_call_input.delta"]
+    assert "".join(deltas) == "echo ok"
+
+
 def test_stream_adapter_standard_function_call_delta_streaming():
     adapter = ResponsesStreamAdapter(
         response_id="resp_unit_3",

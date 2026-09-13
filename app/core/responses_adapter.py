@@ -57,6 +57,10 @@ def extract_custom_tool_input(raw: Any) -> str:
             val = val.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
         return val
 
+    # Incomplete JSON prefix during streaming before "input" key/value
+    if s.startswith("{") or s.startswith("["):
+        return ""
+
     return s
 
 
